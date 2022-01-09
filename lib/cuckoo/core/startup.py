@@ -270,7 +270,7 @@ def init_yara():
     if not HAVE_YARA:
         return
 
-    categories = ("binaries", "urls", "memory", "CAPE", "macro", "monitor")
+    categories = ("binaries", "urls", "memory", "CAPE", "macro", "monitor", "custom")
 
     log.debug("Initializing Yara...")
 

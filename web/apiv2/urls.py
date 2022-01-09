@@ -2,7 +2,7 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file "docs/LICENSE" for copying permission.
 
-from apiv2 import views
+from apiv2 import views, views_custom
 
 # from django.conf.urls import include
 from django.urls import path, re_path
@@ -69,4 +69,7 @@ urlpatterns = [
     # re_path(r"^tasks/add/(?P<category>[A-Za-z0-9]+)/(?P<task_id>\d+)/$", views.post_processing),
     re_path(r"^tasks/statistics/(?P<days>\d+)/$", views.statistics_data),
     re_path(r"^exitnodes/$", views.exit_nodes_list),
+    re_path(r"^yara/upload$", views_custom.upload_yara),
+    re_path(r"^yara/<uuid:_id>$", views_custom.delete_yara),
+    re_path(r"^yara/clean_up$", views_custom.clean_up_yara),
 ]
