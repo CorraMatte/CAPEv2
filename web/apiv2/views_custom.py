@@ -5,6 +5,7 @@ from django.views.decorators.csrf import csrf_exempt
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
+from lib.cuckoo.common.cape_utils import init_yara
 from lib.cuckoo.common.constants import CUCKOO_ROOT
 
 YARA_BASE_FOLDER = os.path.join(CUCKOO_ROOT, "data", "yara")
@@ -29,6 +30,7 @@ def upload_yara(request):
         with open(full_path, 'w') as f:
             f.write(body)
 
+    init_yara()
     return Response({'yara': filename, 'error': False})
 
 
@@ -42,6 +44,7 @@ def delete_yara(request, _id):
         except FileNotFoundError:
             return Response({'error_value': 'Yara not found', 'error': True})
 
+    init_yara()
     return Response({'error': False})
 
 
@@ -57,6 +60,7 @@ def clean_up_yara(request):
                 # Rule is not a custom one
                 pass
 
+    init_yara()
     return Response({'error': False})
 
 

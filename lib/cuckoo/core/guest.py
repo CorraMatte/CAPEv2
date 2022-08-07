@@ -18,7 +18,6 @@ from zipfile import ZIP_STORED, ZipFile
 
 import requests
 
-from lib.cuckoo.common.cape_utils import init_yara
 from lib.cuckoo.common.config import Config, parse_options
 from lib.cuckoo.common.constants import ANALYSIS_BASE_PATH, CUCKOO_GUEST_PORT, CUCKOO_ROOT
 from lib.cuckoo.common.exceptions import CuckooGuestCriticalTimeout, CuckooGuestError
@@ -261,8 +260,6 @@ class GuestManager:
         @param options: the task options
         """
         log.info("Task #%s: Starting analysis on guest (id=%s, ip=%s)", self.task_id, self.vmid, self.ipaddr)
-
-        init_yara()
 
         self.options = options
         self.timeout = options["timeout"] + cfg.timeouts.critical
