@@ -13,7 +13,7 @@ from lib.cuckoo.common.suricatasc import SuricataSC, SuricataCommandException
 
 YARA_BASE_FOLDER = os.path.join(CUCKOO_ROOT, "data", "yara")
 YARA_CUSTOM_RULE_FOLDERS = [os.path.join(YARA_BASE_FOLDER, "custom"), os.path.join(YARA_BASE_FOLDER, "memory")]
-SNORT_BASE_FOLDER = os.path.join("/", "etc", "suricata", "rules")
+SURICATA_BASE_FOLDER = os.path.join("/", "etc", "suricata", "rules")
 
 
 @csrf_exempt
@@ -96,7 +96,7 @@ def update_suricata_rules():
 
 @csrf_exempt
 @api_view(["POST"])
-def upload_snort(request, reload_rule: bool = True):
+def upload_suricata(request, reload_rule: bool = True):
     try:
         _id = request.data["id"]
         body = request.data["body"]
@@ -104,7 +104,7 @@ def upload_snort(request, reload_rule: bool = True):
         return Response({"error": True, "error_value": "id or body not set in request"})
 
     filename = _id + ".rules"
-    full_path = os.path.join(SNORT_BASE_FOLDER, filename)
+    full_path = os.path.join(SURICATA_BASE_FOLDER, filename)
 
     with open(full_path, "w") as f:
         f.write(body)
@@ -118,19 +118,19 @@ def upload_snort(request, reload_rule: bool = True):
 
         except Exception as e:
             os.remove(full_path)
-            return {"error": True, "error_value": f"Unable to refresh Snort rule due to {e}"}
+            return {"error": True, "error_value": f"Unable to refresh Suricata rule due to {e}"}
 
-    return Response({"snort": filename, "error": False})
+    return Response({"suricata": filename, "error": False})
 
 
 @csrf_exempt
 @api_view(["DELETE"])
-def delete_snort(request, _id, reload_rule: bool = True):
-    full_path = os.path.join(SNORT_BASE_FOLDER, f"{_id}.rules")
+def delete_suricata(request, _id, reload_rule: bool = True):
+    full_path = os.path.join(SURICATA_BASE_FOLDER, f"{_id}.rules")
     try:
         os.remove(full_path)
     except FileNotFoundError:
-        return Response({"error_value": "Snort not found", "error": True})
+        return Response({"error_value": "Suricata not found", "error": True})
 
     if reload_rule:
         try:
@@ -140,18 +140,18 @@ def delete_snort(request, _id, reload_rule: bool = True):
                 raise SuricataCommandException(f"ruleset-reload-nonblocking command return with {cmd_out}")
 
         except Exception as e:
-            return {"error": True, "error_value": f"Unable to refresh Snort rule due to {e}"}
+            return {"error": True, "error_value": f"Unable to refresh Suricata rule due to {e}"}
 
     return Response({"error": False})
 
 
 @csrf_exempt
 @api_view(["POST"])
-def clean_up_snort(request):
-    for f in os.listdir(SNORT_BASE_FOLDER):
+def clean_up_suricata(request):
+    for f in os.listdir(SURICATA_BASE_FOLDER):
         try:
             uuid.UUID(f[:-4])
-            os.remove(os.path.join(SNORT_BASE_FOLDER, f))
+            os.remove(os.path.join(SURICATA_BASE_FOLDER, f))
         except ValueError:
             # Rule is not a custom one
             pass
@@ -163,6 +163,6 @@ def clean_up_snort(request):
             raise SuricataCommandException(f"ruleset-reload-nonblocking command return with {cmd_out}")
 
     except Exception as e:
-        return {"error": True, "error_value": f"Unable to refresh Snort rule due to {e}"}
+        return {"error": True, "error_value": f"Unable to refresh Suricata rule due to {e}"}
 
     return Response({"error": False})

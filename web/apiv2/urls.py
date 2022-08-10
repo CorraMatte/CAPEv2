@@ -72,7 +72,7 @@ urlpatterns = [
     re_path(r"^yara/upload/$", views_custom.upload_yara),
     re_path(r"^yara/(?P<_id>[0-9a-f]{8}\b-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-\b[0-9a-f]{12})/$", views_custom.delete_yara),
     re_path(r"^yara/clean_up/$", views_custom.clean_up_yara),
-    re_path(r"^snort/upload/$", views_custom.upload_snort),
-    re_path(r"^snort/(?P<_id>[0-9a-f]{8}\b-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-\b[0-9a-f]{12})/$", views_custom.delete_snort),
-    re_path(r"^snort/clean_up/$", views_custom.clean_up_snort),
+    re_path(r"^suricata/upload/$", views_custom.upload_suricata),
+    re_path(r"^suricata/(?P<_id>[0-9a-f]{8}\b-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-\b[0-9a-f]{12})/$", views_custom.delete_suricata),
+    re_path(r"^suricata/clean_up/$", views_custom.clean_up_suricata),
 ]
