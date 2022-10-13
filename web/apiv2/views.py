@@ -108,7 +108,7 @@ if repconf.mongodb.enabled:
 
 es_as_db = False
 if repconf.elasticsearchdb.enabled and not repconf.elasticsearchdb.searchonly:
-    from dev_utils.elasticsearchdb import elastic_handler, get_analysis_index, get_query_by_info_id
+    from dev_utils.elasticsearchdb import elastic_handler, get_analysis_index, get_query_by_info_id, delete_analysis_and_related_calls
 
     es_as_db = True
     es = elastic_handler
@@ -1100,7 +1100,10 @@ def tasks_delete(request, task_id, status=False):
         if db.delete_task(task):
             delete_folder(os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task))
             if web_conf.web_reporting.get("enabled", True):
-                mongo_delete_data(task)
+                if repconf.mongodb.enabled:
+                    mongo_delete_data(task)
+                elif repconf.elasticsearchdb.enabled:
+                    delete_analysis_and_related_calls(str(task))
 
             s_deleted.append(str(task))
         else:
