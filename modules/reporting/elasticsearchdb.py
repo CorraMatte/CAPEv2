@@ -111,11 +111,12 @@ class ElasticSearchDB(Report):
                     p['tlsh'] = None
 
     def convert_procdump_strings_to_str(self, report):
-        for item in report['procdump']:
-            for k, val in item.items():
-                if k == 'strings':
-                    for index, string in enumerate(val):
-                        val[index] = str(string)
+        if 'procdump' in report and report['procdump']:
+            for item in report['procdump']:
+                for k, val in item.items():
+                    if k == 'strings':
+                        for index, string in enumerate(val):
+                            val[index] = str(string)
 
     def fix_fields(self, report):
         self.fix_suricata_http_status(report)
