@@ -94,7 +94,7 @@ class ElasticSearchDB(Report):
                 for k, val in f.items():
                     if isinstance(val, str) or isinstance(val, bool):
                         f[k] = {'name': str(val)}
-                    if k == 'file':
+                    if k == 'file' and isinstance(val, list):
                         for index, file in enumerate(val):
                             val[index] = {'name': file}
 
@@ -104,13 +104,24 @@ class ElasticSearchDB(Report):
                 if http['status'] == 'None':
                     http['status'] = None
 
+    def fix_cape_payloads(self, report):
+        if 'CAPE' in report:
+            for p in report['CAPE']['payloads']:
+                if p['tlsh'] is False:
+                    p['tlsh'] = None
+
+    def convert_procdump_strings_to_str(self, report):
+        for item in report['procdump']:
+            for k, val in item.items():
+                if k == 'strings':
+                    for index, string in enumerate(val):
+                        val[index] = str(string)
+
     def fix_fields(self, report):
         self.fix_suricata_http_status(report)
         self.fix_signature_results(report)
-
-        for p in report['CAPE']['payloads']:
-            if p['tlsh'] is False:
-                p['tlsh'] = None
+        self.fix_cape_payloads(report)
+        self.convert_procdump_strings_to_str(report)
 
     def date_hook(self, json_dict):
         for (key, value) in json_dict.items():
