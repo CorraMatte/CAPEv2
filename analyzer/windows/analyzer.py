@@ -6,10 +6,14 @@
 
 import hashlib
 import logging
+from __future__ import absolute_import
 import os
-import pkgutil
 import socket
 import struct
+import pkgutil
+import logging
+import hashlib
+import time
 import subprocess
 import sys
 import timeit
@@ -284,6 +288,37 @@ class Analyzer:
         # we store the path.
         if self.config.category == "file":
             self.target = os.path.join(os.environ["TEMP"] + os.sep, str(self.config.file_name))
+            malware_sample_readed = open(self.target, 'rb').read()
+            sha256 = hashlib.sha256(malware_sample_readed).hexdigest()
+            sha1 = hashlib.sha1(malware_sample_readed).hexdigest()
+            md5 = hashlib.md5(malware_sample_readed).hexdigest()
+
+            program_files_path = os.environ['PROGRAMW6432']
+            config_path = os.path.join(program_files_path, 'Elastic', 'Agent', 'elastic-agent.yml')
+
+            with open(config_path, 'r') as config_in:
+                config_to_format = config_in.read()
+
+            config_formatted = config_to_format.format(
+                md5, sha1, sha256,
+                md5, sha1, sha256,
+
+                md5, sha1, sha256,
+                md5, sha1, sha256,
+
+                md5, sha1, sha256,
+                md5, sha1, sha256,
+
+                md5, sha1, sha256,
+            )
+
+            with open(config_path, 'w') as config_out:
+                config_out.write(config_formatted)
+
+            win32serviceutil.RestartService('Elastic Agent')
+
+            time.sleep(15)
+
         # If it's a URL, well.. we store the URL.
         else:
             self.target = self.config.target
@@ -462,7 +497,7 @@ class Analyzer:
         # Walk through the available auxiliary modules.
         aux_avail = []
 
-        for module in sorted(Auxiliary.__subclasses__(), key=lambda x: x.start_priority, reverse=True):
+        for module in sorted(Auxiliary.__subclasses__(), key=lambda x: x.priority, reverse=True):
             # Try to start the auxiliary module.
             # if module.__name__ == "Screenshots" and disable_screens:
             #    continue
@@ -684,12 +719,11 @@ class Analyzer:
 
         log.info("Stopping auxiliary modules")
         # Terminate the Auxiliary modules.
-        for aux in sorted(AUX_ENABLED, key=lambda x: x.stop_priority, reverse=True):
+        for aux in sorted(AUX_ENABLED, key=lambda x: x.priority, reverse=True):
             if not hasattr(aux, "stop"):
                 continue
             try:
                 aux.stop()
-                log.info("Stopped auxiliary modules: %s", aux)
             except (NotImplementedError, AttributeError):
                 continue
             except Exception as e:

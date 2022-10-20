@@ -76,10 +76,12 @@ class ElasticSearchDB(Report):
             raise CuckooDependencyError(f"Unable to create Elasticsearch index {e}")
 
     def format_dates(self, report):
-        report["info"]["started"] = datetime.strptime(report["info"]["started"], "%Y-%m-%d %H:%M:%S")
-        report["info"]["ended"] = datetime.strptime(report["info"]["ended"], "%Y-%m-%d %H:%M:%S")
-        report["info"]["machine"]["started_on"] = datetime.strptime(report["info"]["machine"]["started_on"], "%Y-%m-%d %H:%M:%S")
-        report["info"]["machine"]["shutdown_on"] = datetime.strptime(report["info"]["machine"]["shutdown_on"], "%Y-%m-%d %H:%M:%S")
+        info = report["info"]
+
+        report["info"]["started"] = datetime.strptime(info["started"], "%Y-%m-%d %H:%M:%S") if isinstance(info["started"], str) else info["started"]
+        report["info"]["ended"] = datetime.strptime(info["ended"], "%Y-%m-%d %H:%M:%S") if isinstance(info["ended"], str) else info["ended"]
+        report["info"]["machine"]["started_on"] = datetime.strptime(info["machine"]["started_on"], "%Y-%m-%d %H:%M:%S") if isinstance(info["machine"]["started_on"], str) else info["machine"]["started_on"]
+        report["info"]["machine"]["shutdown_on"] = datetime.strptime(info["machine"]["shutdown_on"], "%Y-%m-%d %H:%M:%S") if isinstance(info["machine"]["shutdown_on"], str) else info["machine"]["shutdown_on"]
 
         for dropped in report['dropped']:
             if 'pe' in dropped:
@@ -90,12 +92,11 @@ class ElasticSearchDB(Report):
         for s in report['signatures']:
             for f in s['data']:
                 for k, val in f.items():
-                    if isinstance(val, str):
-                        f[k] = {'name': val}
-                    elif isinstance(val, list) and len(val) == 1:
-                        f[k] = {'name': val[0]}
-                    elif 'name' in f[k] and isinstance(f[k]['name'], dict) and 'name' in f[k]['name']:
-                        f[k] = f[k]['name']
+                    if isinstance(val, str) or isinstance(val, bool):
+                        f[k] = {'name': str(val)}
+                    if k == 'file':
+                        for index, file in enumerate(val):
+                            val[index] = {'name': file}
 
     def fix_suricata_http_status(self, report):
         if 'http' in report['suricata']:
