@@ -23,6 +23,7 @@ from shutil import copy
 from threading import Lock
 from urllib.parse import urlencode
 from urllib.request import urlopen
+import win32serviceutil
 
 from lib.api.process import Process
 from lib.common.abstracts import Auxiliary, Package
