@@ -1,5 +1,7 @@
+import grp
 import json
 import os
+import pwd
 import uuid
 
 from django.views.decorators.csrf import csrf_exempt
@@ -108,6 +110,11 @@ def upload_suricata(request, reload_rule: bool = True):
 
     with open(full_path, "w") as f:
         f.write(body)
+
+    uid = pwd.getpwnam("cape").pw_uid
+    gid = grp.getgrnam("suricata").gr_gid
+
+    os.chown(full_path, uid, gid)
 
     if reload_rule:
         try:

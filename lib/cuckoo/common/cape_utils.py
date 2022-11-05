@@ -141,7 +141,7 @@ BUFSIZE = int(cfg.processing.analysis_size_limit)
 def init_yara():
     """Generates index for yara signatures."""
 
-    categories = ("binaries", "urls", "memory", "CAPE", "macro", "monitor")
+    categories = ("binaries", "urls", "memory", "CAPE", "macro", "monitor", "custom")
 
     log.debug("Initializing Yara...")
 
