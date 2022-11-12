@@ -14,7 +14,7 @@ from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.common.suricatasc import SuricataSC, SuricataCommandException
 
 YARA_BASE_FOLDER = os.path.join(CUCKOO_ROOT, "data", "yara")
-YARA_CUSTOM_RULE_FOLDERS = [os.path.join(YARA_BASE_FOLDER, "custom"), os.path.join(YARA_BASE_FOLDER, "memory")]
+YARA_CUSTOM_RULE_FOLDERS = [os.path.join(YARA_BASE_FOLDER, "custom")]
 SURICATA_BASE_FOLDER = os.path.join("/", "etc", "suricata", "rules")
 
 

@@ -188,6 +188,16 @@ def init_yara():
             except yara.Error as e:
                 log.error("There was a syntax error in one or more Yara rules: %s", e)
                 break
+
+        # Generate path for the category's index file.
+        index_name = "index_{0}.yar".format(category)
+        index_path = os.path.join(yara_root, index_name)
+
+        # Create index file and populate it.
+        with open(index_path, "w") as index_handle:
+            for signature in indexed:
+                index_handle.write('include "{0}"\n'.format(signature))
+
         if category == "memory":
             try:
                 mem_rules = yara.compile(filepaths=rules, externals=externals)

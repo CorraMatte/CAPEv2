@@ -418,30 +418,32 @@ class File:
         if not os.path.getsize(self.file_path):
             return results
 
-        try:
-            results, rule = [], File.yara_rules[category]
-            if isinstance(self.file_path, bytes):
-                path = self.file_path.decode()
-            else:
-                path = self.file_path
-            for match in rule.match(path, externals=externals):
-                strings = {self._yara_encode_string(s[2]) for s in match.strings}
-                addresses = {s[1].strip("$"): s[0] for s in match.strings}
-                results.append(
-                    {
-                        "name": match.rule,
-                        "meta": match.meta,
-                        "strings": list(strings),
-                        "addresses": addresses,
-                    }
-                )
-        except Exception as e:
-            errcode = str(e).rsplit(maxsplit=1)[-1]
-            if errcode in yara_error:
-                log.exception("Unable to match Yara signatures for %s: %s", self.file_path, yara_error[errcode])
+        results = []
+        for c in [category, 'custom']:
+            try:
+                rule = File.yara_rules[c]
+                if isinstance(self.file_path, bytes):
+                    path = self.file_path.decode()
+                else:
+                    path = self.file_path
+                for match in rule.match(path, externals=externals):
+                    strings = {self._yara_encode_string(s[2]) for s in match.strings}
+                    addresses = {s[1].strip("$"): s[0] for s in match.strings}
+                    results.append(
+                        {
+                            "name": match.rule,
+                            "meta": match.meta,
+                            "strings": list(strings),
+                            "addresses": addresses,
+                        }
+                    )
+            except Exception as e:
+                errcode = str(e).rsplit(maxsplit=1)[-1]
+                if errcode in yara_error:
+                    log.exception("Unable to match Yara signatures for %s: %s", self.file_path, yara_error[errcode])
 
-            else:
-                log.exception("Unable to match Yara signatures for %s: unknown code %s", self.file_path, errcode)
+                else:
+                    log.exception("Unable to match Yara signatures for %s: unknown code %s", self.file_path, errcode)
 
         return results
 
