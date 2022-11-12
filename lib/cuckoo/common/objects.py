@@ -14,6 +14,7 @@ import struct
 import subprocess
 from typing import Any, Dict
 
+from lib.cuckoo.common.cape_utils import init_yara
 from lib.cuckoo.common.defines import (
     PAGE_EXECUTE,
     PAGE_EXECUTE_READ,
@@ -408,6 +409,8 @@ class File:
         """Get Yara signatures matches.
         @return: matched Yara signatures.
         """
+        init_yara()
+
         results = []
         if not HAVE_YARA:
             if not File.notified_yara:
