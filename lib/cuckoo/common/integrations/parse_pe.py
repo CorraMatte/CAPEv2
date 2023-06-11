@@ -11,16 +11,18 @@ import itertools
 import json
 import logging
 import math
-import os
 import struct
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 from PIL import Image
 
+from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.common.icon import PEGroupIconDir
+from lib.cuckoo.common.path_utils import path_exists, path_read_file
 
 try:
     import cryptography
@@ -52,18 +54,20 @@ try:
 except ImportError:
     import re
 
+process_cfg = Config("processing")
 
 HAVE_USERDB = False
-try:
-    import peutils
+if process_cfg.CAPE.userdb_signature:
+    try:
+        import peutils
 
-    userdb_path = os.path.join(CUCKOO_ROOT, "data", "peutils", "UserDB.TXT")
-    userdb_signatures = peutils.SignatureDatabase()
-    if os.path.exists(userdb_path):
-        userdb_signatures.load(userdb_path)
-        HAVE_USERDB = True
-except (ImportError, AttributeError) as e:
-    print(f"Failed to initialize peutils: {str(e)}")
+        userdb_path = Path(CUCKOO_ROOT, "data", "peutils", "UserDB.TXT")
+        userdb_signatures = peutils.SignatureDatabase()
+        if userdb_path.exists():
+            userdb_signatures.load(userdb_path)
+            HAVE_USERDB = True
+    except (ImportError, AttributeError) as e:
+        print(f"Failed to initialize peutils: {e}")
 
 
 log = logging.getLogger(__name__)
@@ -113,10 +117,10 @@ def IsPEImage(buf: bytes, size: int = False) -> bool:
 
     try:
         # if ((pNtHeader->FileHeader.Machine == 0) || (pNtHeader->FileHeader.SizeOfOptionalHeader == 0 || pNtHeader->OptionalHeader.SizeOfHeaders == 0))
-        if (
-            struct.unpack("<H", nt_headers[4:6])[0] == 0
-            or struct.unpack("<H", nt_headers[20:22])[0] == 0
-            or struct.unpack("<H", nt_headers[84:86])[0] == 0
+        if 0 in (
+            struct.unpack("<H", nt_headers[4:6])[0],
+            struct.unpack("<H", nt_headers[20:22])[0],
+            struct.unpack("<H", nt_headers[84:86])[0],
         ):
             return False
 
@@ -143,14 +147,18 @@ def IsPEImage(buf: bytes, size: int = False) -> bool:
 class PortableExecutable:
     """PE analysis."""
 
-    def __init__(self, file_path: str):
+    def __init__(self, file_path: str = False, data: bytes = False):
         """@param file_path: file path."""
-        self.file_path = file_path
+        if file_path:
+            self.file_path = file_path if isinstance(file_path, str) else file_path.decode()
         self._file_data = None
         self.pe = None
         self.HAVE_PE = False
         try:
-            self.pe = pefile.PE(self.file_path)
+            if data:
+                self.pe = pefile.PE(data=data)
+            else:
+                self.pe = pefile.PE(self.file_path)
             self.HAVE_PE = True
         except Exception as e:
             log.error("PE type not recognised: %s", e)
@@ -158,10 +166,8 @@ class PortableExecutable:
 
     @property
     def file_data(self):
-        if not self._file_data:
-            if os.path.exists(self.file_path):
-                with open(self.file_path, "rb") as f:
-                    self._file_data = f.read()
+        if not self._file_data and path_exists(self.file_path):
+            self._file_data = path_read_file(self.file_path)
         return self._file_data
 
     def is_64bit(self) -> bool:
@@ -216,6 +222,18 @@ class PortableExecutable:
             log.error(e, exc_info=True)
 
         return None
+
+    def get_overlay_raw(self) -> int:
+        """Get information on the PE overlay
+        @return: overlay offset or None.
+        """
+        if not self.pe:
+            return None
+
+        return (
+            self.pe.sections[self.pe.FILE_HEADER.NumberOfSections - 1].PointerToRawData
+            + self.pe.sections[self.pe.FILE_HEADER.NumberOfSections - 1].SizeOfRawData
+        )
 
     def get_overlay(self, pe: pefile.PE) -> dict:
         """Get information on the PE overlay
@@ -543,7 +561,7 @@ class PortableExecutable:
             if value:
                 decimal_value += 2 ** (index % 8)
             if index % 8 == 7:
-                hex_string.append(hex(decimal_value)[2:].rjust(2, "0"))
+                hex_string.append(f"{hex(decimal_value):2}"[2:].rjust(2, "0"))
                 decimal_value = 0
 
         return "".join(hex_string)
@@ -802,11 +820,9 @@ class PortableExecutable:
     def get_guest_digital_signers(self, task_id: str = False) -> dict:
         if not task_id:
             return {}
-        cert_info = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id, "aux", "DigiSig.json")
-
-        if os.path.exists(cert_info):
-            with open(cert_info, "r") as cert_file:
-                cert_data = json.load(cert_file)
+        cert_info_path = Path(CUCKOO_ROOT, "storage", "analyses", task_id, "aux", "DigiSig.json")
+        if cert_info_path.exists():
+            cert_data = json.loads(cert_info_path.read_text())
             if cert_data:
                 return {
                     "aux_sha1": cert_data["sha1"],
@@ -846,21 +862,11 @@ class PortableExecutable:
         if not self.pe:
             return None
         if hasattr(self.pe, "DIRECTORY_ENTRY_EXPORT"):
-            exports = []
             for exp in self.pe.DIRECTORY_ENTRY_EXPORT.symbols:
                 try:
                     if not exp.name:
                         continue
-                    if exp.name.decode() in ["DllInstall", "DllRegisterServer", "xlAutoOpen"]:
-                        return exp.name.decode()
-                    entry = self.pe.get_offset_from_rva(exp.address)
-                    if (
-                        self.is_64bit()
-                        and self.file_data[entry] == 0xB9
-                        and self.file_data[entry + 5] in [0xE8, 0xE9]
-                        or self.file_data[entry + 4] == 0xB9
-                        and self.file_data[entry + 9] in [0xE8, 0xE9]
-                    ):
+                    if exp.name.decode() in ("DllInstall", "DllRegisterServer", "xlAutoOpen"):
                         return exp.name.decode()
                 except Exception as e:
                     log.error(e, exc_info=True)
@@ -872,7 +878,7 @@ class PortableExecutable:
         """
 
         try:
-            return f"0x{pe.OPTIONAL_HEADER.ImageBase + pe.OPTIONAL_HEADER.AddressOfEntryPoint:08x}"
+            return f"0x{pe.OPTIONAL_HEADER.AddressOfEntryPoint:08x}"
         except Exception:
             return None
 
@@ -898,13 +904,12 @@ class PortableExecutable:
         """Run analysis.
         @return: analysis results dict or None.
         """
-        if not os.path.exists(self.file_path):
+        if not path_exists(self.file_path):
             log.debug("File doesn't exist anymore")
             return {}
 
         # Advanced check if is real PE
-        with open(self.file_path, "rb") as f:
-            contents = f.read()
+        contents = path_read_file(self.file_path)
         if not IsPEImage(contents):
             return {}
 

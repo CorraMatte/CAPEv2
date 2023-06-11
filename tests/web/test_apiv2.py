@@ -1,7 +1,6 @@
-import os
-import unittest.mock
 from unittest.mock import patch
 
+import pytest
 from django.test import SimpleTestCase
 
 from lib.cuckoo.core.database import (
@@ -20,6 +19,7 @@ from lib.cuckoo.core.database import (
 )
 
 
+@pytest.mark.usefixtures("tmp_cuckoo_root")
 class ReprocessTask(SimpleTestCase):
 
     taskprocess_config = "lib.cuckoo.common.web_utils.apiconf.taskreprocess"

@@ -11,6 +11,7 @@ import threading
 import time
 import timeit
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from typing import Dict, List
 
 try:
@@ -28,7 +29,9 @@ from lib.cuckoo.common.exceptions import (
     CuckooOperationalError,
     CuckooReportError,
 )
+from lib.cuckoo.common.integrations.mitre import mitre_load
 from lib.cuckoo.common.objects import Dictionary
+from lib.cuckoo.common.path_utils import path_exists
 from lib.cuckoo.common.url_validate import url as url_validator
 from lib.cuckoo.common.utils import create_folder, get_memdump_path, load_categories
 from lib.cuckoo.core.database import Database
@@ -55,32 +58,8 @@ except ImportError:
 
 repconf = Config("reporting")
 _, categories_need_VM = load_categories()
-HAVE_MITRE = False
 
-if repconf.mitre.enabled:
-    try:
-        from pyattck import Attck
-        from pyattck.utils.version import __version_info__ as pyattck_version
-
-        if pyattck_version >= (4, 1, 1) and pyattck_version <= (5, 2, 0):
-            mitre = Attck(
-                nested_subtechniques=True,
-                use_config=True,
-                save_config=True,
-                config_file_path=os.path.join(CUCKOO_ROOT, "data", "mitre", "config.yml"),
-                data_path=os.path.join(CUCKOO_ROOT, "data", "mitre"),
-                enterprise_attck_json=os.path.join(CUCKOO_ROOT, "data", "mitre", "enterprise_attck_json.json"),
-                pre_attck_json=os.path.join(CUCKOO_ROOT, "data", "mitre", "pre_attck_json.json"),
-                mobile_attck_json=os.path.join(CUCKOO_ROOT, "data", "mitre", "mobile_attck_json.json"),
-                ics_attck_json=os.path.join(CUCKOO_ROOT, "data", "mitre", "ics_attck_json.json"),
-                nist_controls_json=os.path.join(CUCKOO_ROOT, "data", "mitre", "nist_controls_json.json"),
-                generated_attck_json=os.path.join(CUCKOO_ROOT, "data", "mitre", "generated_attck_json.json"),
-                generated_nist_json=os.path.join(CUCKOO_ROOT, "data", "mitre", "generated_nist_json.json"),
-            )
-            HAVE_MITRE = True
-
-    except ImportError:
-        print("Missed pyattck dependency: check requirements.txt for exact pyattck version")
+mitre, HAVE_MITRE, _ = mitre_load(repconf.mitre.enabled)
 
 log = logging.getLogger(__name__)
 cfg = Config()
@@ -170,6 +149,7 @@ class Machinery:
                 machine.tags = machine_opts.get("tags")
                 machine.ip = machine_opts["ip"]
                 machine.arch = machine_opts["arch"]
+                machine.reserved = machine_opts.get("reserved", False)
 
                 # If configured, use specific network interface for this
                 # machine, else use the default value.
@@ -182,26 +162,15 @@ class Machinery:
                 # empty and use default behaviour.
                 machine.snapshot = machine_opts.get("snapshot")
 
-                if machine.get("resultserver_ip"):
-                    ip = machine["resultserver_ip"]
-                else:
-                    ip = cfg.resultserver.ip
-
-                if machine.get("resultserver_port"):
-                    port = machine["resultserver_port"]
-                else:
+                machine.resultserver_ip = machine_opts.get("resultserver_ip", cfg.resultserver.ip)
+                machine.resultserver_port = machine_opts.get("resultserver_port")
+                if machine.resultserver_port is None:
                     # The ResultServer port might have been dynamically changed,
                     # get it from the ResultServer singleton. Also avoid import
                     # recursion issues by importing ResultServer here.
                     from lib.cuckoo.core.resultserver import ResultServer
 
-                    port = ResultServer().port
-
-                ip = machine_opts.get("resultserver_ip", ip)
-                port = machine_opts.get("resultserver_port", port)
-
-                machine.resultserver_ip = ip
-                machine.resultserver_port = port
+                    machine.resultserver_port = ResultServer().port
 
                 # Strip parameters.
                 for key, value in machine.items():
@@ -217,8 +186,9 @@ class Machinery:
                     tags=machine.tags,
                     interface=machine.interface,
                     snapshot=machine.snapshot,
-                    resultserver_ip=ip,
-                    resultserver_port=port,
+                    resultserver_ip=machine.resultserver_ip,
+                    resultserver_port=machine.resultserver_port,
+                    reserved=machine.reserved,
                 )
             except (AttributeError, CuckooOperationalError) as e:
                 log.warning("Configuration details about machine %s are missing: %s", machine_id.strip(), e)
@@ -240,7 +210,7 @@ class Machinery:
         for machine in self.machines():
             # If this machine is already in the "correct" state, then we
             # go on to the next machine.
-            if machine.label in configured_vms and self._status(machine.label) in [self.POWEROFF, self.ABORTED]:
+            if machine.label in configured_vms and self._status(machine.label) in (self.POWEROFF, self.ABORTED):
                 continue
 
             # This machine is currently not in its correct state, we're going
@@ -258,19 +228,21 @@ class Machinery:
         """List virtual machines.
         @return: virtual machines list
         """
-        return self.db.list_machines()
+        return self.db.list_machines(include_reserved=True)
 
-    def availables(self, machine_id=None, platform=None, tags=None, arch=None):
+    def availables(self, label=None, platform=None, tags=None, arch=None, include_reserved=False, os_version=[]):
         """How many (relevant) machines are free.
-        @param machine_id: machine ID.
+        @param label: machine ID.
         @param platform: machine platform.
         @param tags: machine tags
         @param arch: machine arch
         @return: free machines count.
         """
-        return self.db.count_machines_available(machine_id=machine_id, platform=platform, tags=tags, arch=arch)
+        return self.db.count_machines_available(
+            label=label, platform=platform, tags=tags, arch=arch, include_reserved=include_reserved, os_version=os_version
+        )
 
-    def acquire(self, machine_id=None, platform=None, tags=None, arch=None):
+    def acquire(self, machine_id=None, platform=None, tags=None, arch=None, os_version=[]):
         """Acquire a machine to start analysis.
         @param machine_id: machine ID.
         @param platform: machine platform.
@@ -281,9 +253,8 @@ class Machinery:
         if machine_id:
             return self.db.lock_machine(label=machine_id)
         elif platform:
-            return self.db.lock_machine(platform=platform, tags=tags, arch=arch)
-        else:
-            return self.db.lock_machine(tags=tags, arch=arch)
+            return self.db.lock_machine(platform=platform, tags=tags, arch=arch, os_version=os_version)
+        return self.db.lock_machine(tags=tags, arch=arch, os_version=os_version)
 
     def release(self, label=None):
         """Release a machine.
@@ -910,7 +881,7 @@ class Signature:
                 pids.append(int(pid.get("pid", "")))
                 pids += [int(cpid["pid"]) for cpid in pid.get("children", []) if "pid" in cpid]
         # in case if bsons too big
-        if os.path.exists(logs):
+        if path_exists(logs):
             pids += [int(pidb.replace(".bson", "")) for pidb in os.listdir(logs) if ".bson" in pidb]
 
         #  in case if injection not follows
@@ -1184,7 +1155,7 @@ class Signature:
                       matched items or the first matched item
         """
         subject = self.results["behavior"]["summary"]["started_services"]
-        return self._check_value(pattern=pattern, subject=subject, regex=regex, all=all, ignorecase=True)
+        return self._check_value(pattern=pattern, subject=subject, regex=regex, all=all)
 
     def check_created_service(self, pattern, regex=False, all=False):
         """Checks for a service being created.
@@ -1197,7 +1168,7 @@ class Signature:
                       matched items or the first matched item
         """
         subject = self.results["behavior"]["summary"]["created_services"]
-        return self._check_value(pattern=pattern, subject=subject, regex=regex, all=all, ignorecase=True)
+        return self._check_value(pattern=pattern, subject=subject, regex=regex, all=all)
 
     def check_executed_command(self, pattern, regex=False, all=False, ignorecase=True):
         """Checks for a command being executed.
@@ -1528,13 +1499,12 @@ class Signature:
         return res
 
     def mark_call(self, *args, **kwargs):
-        """Mark the current call as explanation as to why this signature
-        matched."""
+        """Mark the current call as explanation as to why this signature matched."""
+
         mark = {
             "type": "call",
             "pid": self.pid,
             "cid": self.cid,
-            "call": self.call,
         }
 
         if args or kwargs:
@@ -1725,12 +1695,9 @@ class Feed:
             lock = threading.Lock()
             with lock:
                 if modified and self.data:
-                    with open(self.feedpath, "w") as feedfile:
-                        feedfile.write(self.data)
+                    _ = Path(self.feedpath).write_text(self.data)
                 elif self.downloaddata:
-                    with open(self.feedpath, "w") as feedfile:
-                        feedfile.write(self.downloaddata)
-        return
+                    _ = Path(self.feedpath).write_text(self.downloaddata)
 
 
 class ProtocolHandler:

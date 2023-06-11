@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 from optparse import OptionParser
+from pathlib import Path
 from struct import pack, unpack
 
 import pefile
@@ -222,11 +223,7 @@ def u16(a):
 
 
 def dexor(data, key):
-    decrypted = []
-    for i in range(0, len(data)):
-        decrypted.append(data[i] ^ key[i & 3])
-
-    return bytes(decrypted)
+    return bytes([data[i] ^ key[i & 3] for i in range(0, len(data))])
 
 
 def decrypt_memory(file):
@@ -259,7 +256,7 @@ def decrypt_memory(file):
             source="rule foo: bar {strings: $a = {8B 7D ?? B8 ?? ?? ?? ?? EB 0F 41 ?? B7 018B 34 87 49 03 F0 EB ??} condition: $a}"
         )
 
-    data = open(file, "rb").read()
+    data = Path(file).read_bytes()
 
     key_offset = key_rule.match(data=data)
     tag_offset = tag_rule.match(data=data)
@@ -396,24 +393,11 @@ def decrypt_memory(file):
     if MZ:
         uncompressed_payload = b"MZ" + uncompressed_payload[2:]
 
-    with open(save_payload_path, "wb") as f:
-        f.write(uncompressed_payload)
+    _ = Path(save_payload_path).write_bytes(uncompressed_payload)
 
 
 def main():
     print("Author: @Soolidsnake")
-    print(
-        """
-  ____   _  _       _                                    __  _                      _                      _
- |  _ \ | |(_)     | |                                  / _|(_)                    | |                    | |
- | |_) || | _  ___ | |_  ___  _ __    ___  ___   _ __  | |_  _   __ _    ___ __  __| |_  _ __  __ _   ___ | |_  ___   _ __
- |  _ < | || |/ __|| __|/ _ \| '__|  / __|/ _ \ | '_ \ |  _|| | / _` |  / _ \\\\ \/ /| __|| '__|/ _` | / __|| __|/ _ \ | '__|
- | |_) || || |\__ \| |_|  __/| |    | (__| (_) || | | || |  | || (_| | |  __/ >  < | |_ | |  | (_| || (__ | |_| (_) || |
- |____/ |_||_||___/ \__|\___||_|     \___|\___/ |_| |_||_|  |_| \__, |  \___|/_/\_\ \__||_|   \__,_| \___| \__|\___/ |_|
-                                                                 __/ |
-                                                                |___/
-"""  # noqa: W605
-    )
     parser = OptionParser()
 
     parser.add_option("-f", "--file", dest="filename", help="file", metavar="file")
@@ -421,7 +405,7 @@ def main():
     (options, args) = parser.parse_args()
     file_path = options.filename
     dir_path = options.dirname
-    if file_path is None and dir_path is None:
+    if not file_path and not dir_path:
         parser.print_help()
         sys.exit(1)
 
@@ -541,7 +525,6 @@ def extract_config(data):
     uncompressed_data_size = decrypted_config[0x628 : 0x628 + 4]
     flag = u16(decrypted_config[0:2])
     payload_export_hash = decrypted_config[2:6]
-    MZ = True
     w_payload_filename_and_cmdline = ""
     sleep_after_injection = True if (flag & 0x100) != 0 else False
     persistance = True if (flag & 1) != 0 else False
@@ -551,7 +534,6 @@ def extract_config(data):
         injection_method = "Reflective injection"
     elif (flag & 0x40) != 0:
         injection_method = "Execute shellcode"
-        MZ = False
     else:
         if (flag & 8) != 0:
             injection_method = "Process hollowing current executable (rundll32.exe in case of a DLL sample)"

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sys
+from contextlib import suppress
 from datetime import datetime, timedelta
 
 # Sflock does a good filetype recon
@@ -20,7 +21,8 @@ from lib.cuckoo.common.demux import demux_sample
 from lib.cuckoo.common.exceptions import CuckooDatabaseError, CuckooDependencyError, CuckooOperationalError
 from lib.cuckoo.common.integrations.parse_pe import PortableExecutable
 from lib.cuckoo.common.objects import PCAP, URL, File, Static
-from lib.cuckoo.common.utils import Singleton, SuperLock, classlock, create_folder, get_options
+from lib.cuckoo.common.path_utils import path_delete, path_exists
+from lib.cuckoo.common.utils import Singleton, SuperLock, classlock, create_folder
 
 try:
     from sqlalchemy import (
@@ -38,7 +40,6 @@ try:
         event,
         func,
         not_,
-        or_,
     )
     from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
     from sqlalchemy.ext.declarative import declarative_base
@@ -46,11 +47,12 @@ try:
 
     Base = declarative_base()
 except ImportError:
-    raise CuckooDependencyError("Unable to import sqlalchemy (install with `pip3 install sqlalchemy`)")
+    raise CuckooDependencyError("Unable to import sqlalchemy (install with `poetry run pip install sqlalchemy`)")
 
 
 sandbox_packages = (
     "access",
+    "archive",
     "nsis",
     "cpl",
     "reg",
@@ -68,6 +70,7 @@ sandbox_packages = (
     "swf",
     "python",
     "msi",
+    "msix",
     "ps1",
     "msg",
     "eml",
@@ -95,6 +98,7 @@ sandbox_packages = (
     "iso",
     "vhd",
     "udf",
+    "one",
 )
 
 log = logging.getLogger(__name__)
@@ -111,7 +115,7 @@ if repconf.elasticsearchdb.enabled:
 
     es = elastic_handler
 
-SCHEMA_VERSION = "02af0b0ec686"
+SCHEMA_VERSION = "a8441ab0fd0f"
 TASK_BANNED = "banned"
 TASK_PENDING = "pending"
 TASK_RUNNING = "running"
@@ -182,8 +186,7 @@ def _get_linux_vm_tag(mgtype):
         return "x32"
     elif "elf 64-bit" in mgtype and "x86-64" in mgtype:
         return "x64"
-    else:
-        return "x64"
+    return "x64"
 
 
 class Machine(Base):
@@ -192,8 +195,8 @@ class Machine(Base):
     __tablename__ = "machines"
 
     id = Column(Integer(), primary_key=True)
-    name = Column(String(255), nullable=False)
-    label = Column(String(255), nullable=False)
+    name = Column(String(255), nullable=False, unique=True)
+    label = Column(String(255), nullable=False, unique=True)
     arch = Column(String(255), nullable=False)
     ip = Column(String(255), nullable=False)
     platform = Column(String(255), nullable=False)
@@ -206,6 +209,7 @@ class Machine(Base):
     status_changed_on = Column(DateTime(timezone=False), nullable=True)
     resultserver_ip = Column(String(255), nullable=False)
     resultserver_port = Column(String(255), nullable=False)
+    reserved = Column(Boolean(), nullable=False, default=False)
 
     def __repr__(self):
         return f"<Machine('{self.id}','{self.name}')>"
@@ -232,7 +236,7 @@ class Machine(Base):
         """
         return json.dumps(self.to_dict())
 
-    def __init__(self, name, label, arch, ip, platform, interface, snapshot, resultserver_ip, resultserver_port):
+    def __init__(self, name, label, arch, ip, platform, interface, snapshot, resultserver_ip, resultserver_port, reserved):
         self.name = name
         self.label = label
         self.arch = arch
@@ -242,6 +246,7 @@ class Machine(Base):
         self.snapshot = snapshot
         self.resultserver_ip = resultserver_ip
         self.resultserver_port = resultserver_port
+        self.reserved = reserved
 
 
 class Tag(Base):
@@ -409,7 +414,7 @@ class Task(Base):
     tags_tasks = Column(String(256), nullable=True)
     # Virtual machine tags
     tags = relationship("Tag", secondary=tasks_tags, backref="tasks", lazy="subquery")
-    options = Column(String(1024), nullable=True)
+    options = Column(Text(), nullable=True)
     platform = Column(String(255), nullable=True)
     memory = Column(Boolean, nullable=False, default=False)
     enforce_timeout = Column(Boolean, nullable=False, default=False)
@@ -468,6 +473,7 @@ class Task(Base):
     shrike_msg = Column(String(4096), nullable=True)
     shrike_sid = Column(Integer(), nullable=True)
 
+    # To be removed - Deprecate soon, not used anymore
     parent_id = Column(Integer(), nullable=True)
     tlp = Column(String(255), nullable=True)
 
@@ -530,23 +536,23 @@ class Database(object, metaclass=Singleton):
         @param schema_check: disable or enable the db schema version check
         """
         self._lock = SuperLock()
-        self.cfg = Config()
+        self.cfg = conf
 
         if dsn:
             self._connect_database(dsn)
         elif self.cfg.database.connection:
             self._connect_database(self.cfg.database.connection)
         else:
-            db_file = os.path.join(CUCKOO_ROOT, "db", "cuckoo.db")
-            if not os.path.exists(db_file):
-                db_dir = os.path.dirname(db_file)
-                if not os.path.exists(db_dir):
+            file_path = os.path.join(CUCKOO_ROOT, "db", "cuckoo.db")
+            if not path_exists(file_path):
+                db_dir = os.path.dirname(file_path)
+                if not path_exists(db_dir):
                     try:
                         create_folder(folder=db_dir)
                     except CuckooOperationalError as e:
                         raise CuckooDatabaseError(f"Unable to create database directory: {e}")
 
-            self._connect_database(f"sqlite:///{db_file}")
+            self._connect_database(f"sqlite:///{file_path}")
 
         # Disable SQL logging. Turn it on for debugging.
         self.engine.echo = False
@@ -589,15 +595,13 @@ class Database(object, metaclass=Singleton):
                 print(
                     f"DB schema version mismatch: found {last.version_num}, expected {SCHEMA_VERSION}. Try to apply all migrations"
                 )
-                print(red("cd utils/db_migration/ && alembic upgrade head"))
+                print(red("cd utils/db_migration/ && poetry run alembic upgrade head"))
                 sys.exit()
 
     def __del__(self):
         """Disconnects pool."""
-        try:
+        with suppress(KeyError, AttributeError):
             self.engine.dispose()
-        except (KeyError, AttributeError):
-            pass
 
     def _connect_database(self, connection_string):
         """Connect to a Database.
@@ -611,7 +615,9 @@ class Database(object, metaclass=Singleton):
             elif connection_string.startswith("postgres"):
                 # Disabling SSL mode to avoid some errors using sqlalchemy and multiprocesing.
                 # See: http://www.postgresql.org/docs/9.0/static/libpq-ssl.html#LIBPQ-SSL-SSLMODE-STATEMENTS
-                self.engine = create_engine(connection_string, connect_args={"sslmode": "disable"}, pool_pre_ping=True)
+                self.engine = create_engine(
+                    connection_string, connect_args={"sslmode": self.cfg.database.psql_ssl_mode}, pool_pre_ping=True
+                )
             else:
                 self.engine = create_engine(connection_string)
         except ImportError as e:
@@ -677,7 +683,7 @@ class Database(object, metaclass=Singleton):
             session.close()
 
     @classlock
-    def add_machine(self, name, label, arch, ip, platform, tags, interface, snapshot, resultserver_ip, resultserver_port):
+    def add_machine(self, name, label, arch, ip, platform, tags, interface, snapshot, resultserver_ip, resultserver_port, reserved):
         """Add a guest machine.
         @param name: machine id
         @param label: machine label
@@ -689,6 +695,7 @@ class Database(object, metaclass=Singleton):
         @param snapshot: snapshot name to use instead of the current one, if configured
         @param resultserver_ip: IP address of the Result Server
         @param resultserver_port: port of the Result Server
+        @param reserved: True if the machine can only be used when specifically requested
         """
         session = self.Session()
         machine = Machine(
@@ -701,6 +708,7 @@ class Database(object, metaclass=Singleton):
             snapshot=snapshot,
             resultserver_ip=resultserver_ip,
             resultserver_port=resultserver_port,
+            reserved=reserved,
         )
         # Deal with tags format (i.e., foo,bar,baz)
         if tags:
@@ -807,23 +815,51 @@ class Database(object, metaclass=Singleton):
         finally:
             session.close()
 
+    def _package_vm_requires_check(self, package: str) -> list:
+        """
+        We allow to users use their custom tags to tag properly any VM that can run this package
+        """
+        return [vm_tag.strip() for vm_tag in web_conf.packages.get(package).split(",")] if web_conf.packages.get(package) else []
+
+    def _task_arch_tags_helper(self, task: Task):
+        # Are there available machines that match up with a task?
+        task_archs = [tag.name for tag in task.tags if tag.name in ("x86", "x64")]
+        task_tags = [tag.name for tag in task.tags if tag.name not in task_archs]
+
+        return task_archs, task_tags
+
     @classlock
     def is_relevant_machine_available(self, task: Task) -> bool:
         """Checks if a machine that is relevant to the given task is available
         @return: boolean indicating if a relevant machine is available
         """
-        # Are there available machines that match up with a task?
-        task_archs = [tag.name for tag in task.tags if tag.name in ["x86", "x64"]]
-        task_tags = [tag.name for tag in task.tags if tag.name not in task_archs]
-        relevant_available_machines = self.list_machines(
-            locked=False, label=task.machine, platform=task.platform, tags=task_tags, arch=task_archs
+        task_archs, task_tags = self._task_arch_tags_helper(task)
+        os_version = self._package_vm_requires_check(task.package)
+        vms = self.list_machines(
+            locked=False, label=task.machine, platform=task.platform, tags=task_tags, arch=task_archs, os_version=os_version
         )
-        if len(relevant_available_machines) > 0:
+        if len(vms) > 0:
             # There are? Awesome!
             self.set_status(task_id=task.id, status=TASK_RUNNING)
             return True
-        else:
-            return False
+        return False
+
+    @classlock
+    def is_serviceable(self, task: Task) -> bool:
+        """Checks if the task is serviceable.
+
+        This method is useful when there are tasks that will never be serviced
+        by any of the machines available. This allows callers to decide what to
+        do when tasks like this are created.
+
+        @return: boolean indicating if any machine could service the task in the future
+        """
+        task_archs, task_tags = self._task_arch_tags_helper(task)
+        os_version = self._package_vm_requires_check(task.package)
+        vms = self.list_machines(label=task.machine, platform=task.platform, tags=task_tags, arch=task_archs, os_version=os_version)
+        if len(vms) > 0:
+            return True
+        return False
 
     @classlock
     def fetch_task(self, categories: list = []):
@@ -969,9 +1005,15 @@ class Database(object, metaclass=Singleton):
         return machines
 
     @classlock
-    def list_machines(self, locked=None, label=None, platform=None, tags=[], arch=None):
+    def list_machines(self, locked=None, label=None, platform=None, tags=[], arch=None, include_reserved=False, os_version=[]):
         """Lists virtual machines.
         @return: list of virtual machines
+        """
+        """
+        id |  name  | label | arch |
+        ----+-------+-------+------+
+        77 | cape1  | win7  | x86  |
+        78 | cape2  | win10 | x64  |
         """
         session = self.Session()
         try:
@@ -980,10 +1022,16 @@ class Database(object, metaclass=Singleton):
                 machines = machines.filter_by(locked=locked)
             if label:
                 machines = machines.filter_by(label=label)
+            elif not include_reserved:
+                machines = machines.filter_by(reserved=False)
             if platform:
                 machines = machines.filter_by(platform=platform)
             machines = self.filter_machines_by_arch(machines, arch)
+            if os_version:
+                machines = machines.filter(Machine.tags.any(Tag.name.in_(os_version)))
+            # We can't check os version in tags due to that all tags should be satisfied
             if tags:
+                # machines = machines.filter(Machine.tags.all(Tag.name.in_(tags)))
                 for tag in tags:
                     machines = machines.filter(Machine.tags.any(name=tag))
             return machines.all()
@@ -994,12 +1042,13 @@ class Database(object, metaclass=Singleton):
             session.close()
 
     @classlock
-    def lock_machine(self, label=None, platform=None, tags=None, arch=None):
+    def lock_machine(self, label=None, platform=None, tags=None, arch=None, os_version=[]):
         """Places a lock on a free virtual machine.
         @param label: optional virtual machine label
         @param platform: optional virtual machine platform
         @param tags: optional tags required (list)
         @param arch: optional virtual machine arch
+        @os_version: tags to filter per OS version. Ex: winxp, win7, win10, win11
         @return: locked machine
         """
         session = self.Session()
@@ -1020,13 +1069,17 @@ class Database(object, metaclass=Singleton):
             machines = session.query(Machine)
             if label:
                 machines = machines.filter_by(label=label)
+            else:
+                machines = machines.filter_by(reserved=False)
             if platform:
                 machines = machines.filter_by(platform=platform)
             machines = self.filter_machines_by_arch(machines, arch)
             if tags:
+                # machines = machines.filter(Machine.tags.all(Tag.name.in_(tags)))
                 for tag in tags:
                     machines = machines.filter(Machine.tags.any(name=tag))
-
+            if os_version:
+                machines = machines.filter(Machine.tags.any(Tag.name.in_(os_version)))
             # Check if there are any machines that satisfy the
             # selection requirements.
             if not machines.count():
@@ -1092,25 +1145,31 @@ class Database(object, metaclass=Singleton):
         return machine
 
     @classlock
-    def count_machines_available(self, machine_id=None, platform=None, tags=None, arch=None):
+    def count_machines_available(self, label=None, platform=None, tags=None, arch=None, include_reserved=False, os_version=[]):
         """How many (relevant) virtual machines are ready for analysis.
-        @param machine_id: machine ID.
+        @param label: machine ID.
         @param platform: machine platform.
         @param tags: machine tags
         @param arch: machine arch
+        @param include_reserved: include 'reserved' machines in the result, regardless of whether or not a 'label' was provided.
         @return: free virtual machines count
         """
         session = self.Session()
         try:
             machines = session.query(Machine).filter_by(locked=False)
-            if machine_id:
-                machines = machines.filter_by(label=machine_id)
+            if label:
+                machines = machines.filter_by(label=label)
+            elif not include_reserved:
+                machines = machines.filter_by(reserved=False)
             if platform:
                 machines = machines.filter_by(platform=platform)
             machines = self.filter_machines_by_arch(machines, arch)
             if tags:
+                # machines = machines.filter(Machine.tags.all(Tag.name.in_(tags)))
                 for tag in tags:
                     machines = machines.filter(Machine.tags.any(name=tag))
+            if os_version:
+                machines = machines.filter(Machine.tags.any(Tag.name.in_(os_version)))
             return machines.count()
         except SQLAlchemyError as e:
             log.debug("Database error counting machines: %s", e)
@@ -1183,7 +1242,7 @@ class Database(object, metaclass=Singleton):
     @classlock
     def register_sample(self, obj, source_url=False):
         sample_id = None
-        if isinstance(obj, File) or isinstance(obj, PCAP) or isinstance(obj, Static):
+        if isinstance(obj, (File, PCAP, Static)):
             session = self.Session()
             fileobj = File(obj.file_path)
             file_type = fileobj.get_type()
@@ -1229,8 +1288,7 @@ class Database(object, metaclass=Singleton):
                 session.close()
 
             return sample_id
-        else:
-            return None
+        return None
 
     @classlock
     def add(
@@ -1294,7 +1352,7 @@ class Database(object, metaclass=Singleton):
         if not priority:
             priority = 1
 
-        if isinstance(obj, File) or isinstance(obj, PCAP) or isinstance(obj, Static):
+        if isinstance(obj, (File, PCAP, Static)):
             fileobj = File(obj.file_path)
             file_type = fileobj.get_type()
             file_md5 = fileobj.get_md5()
@@ -1364,7 +1422,7 @@ class Database(object, metaclass=Singleton):
             except OperationalError:
                 return None
 
-            if isinstance(obj, PCAP) or isinstance(obj, Static):
+            if isinstance(obj, (PCAP, Static)):
                 # since no VM will operate on this PCAP
                 task.started_on = datetime.now()
 
@@ -1479,7 +1537,7 @@ class Database(object, metaclass=Singleton):
         @username: username from custom auth
         @return: cursor or None.
         """
-        if not file_path or not os.path.exists(file_path):
+        if not file_path or not path_exists(file_path):
             log.warning("File does not exist: %s", file_path)
             return None
 
@@ -1517,6 +1575,28 @@ class Database(object, metaclass=Singleton):
             username=username,
         )
 
+    def _identify_aux_func(self, file: bytes, package: str) -> str:
+        # before demux we need to check as msix has zip mime and we don't want it to be extracted:
+        tmp_package = False
+        if not package:
+            f = SflockFile.from_path(file)
+            try:
+                tmp_package = sflock_identify(f, check_shellcode=True)
+            except Exception as e:
+                log.error(f"Failed to sflock_ident due to {e}")
+                tmp_package = "generic"
+
+        if tmp_package and tmp_package in sandbox_packages:
+            # This probably should be way much bigger list of formats
+            if tmp_package == ("iso", "udf", "vhd"):
+                package = "archive"
+            elif tmp_package in ("zip", "rar"):
+                package = ""
+            else:
+                package = tmp_package
+
+        return package, tmp_package
+
     def demux_sample_and_add_to_db(
         self,
         file_path,
@@ -1536,7 +1616,6 @@ class Database(object, metaclass=Singleton):
         shrike_sid=None,
         shrike_refer=None,
         parent_id=None,
-        sample_parent_id=None,
         tlp=None,
         static=False,
         source_url=False,
@@ -1558,27 +1637,25 @@ class Database(object, metaclass=Singleton):
         # force auto package for linux files
         if platform == "linux":
             package = ""
-        original_options = options
+
+        if not isinstance(file_path, bytes):
+            file_path = file_path.encode()
+
+        if not package:
+            if "file=" in options:
+                # set zip as package when specifying file= in options
+                package = "zip"
+            else:
+                # Checking original file as some filetypes doesn't require demux
+                package, _ = self._identify_aux_func(file_path, package)
+
         # extract files from the (potential) archive
         extracted_files = demux_sample(file_path, package, options)
         # check if len is 1 and the same file, if diff register file, and set parent
-        if not isinstance(file_path, bytes):
-            file_path = file_path.encode()
         if extracted_files and file_path not in extracted_files:
             sample_parent_id = self.register_sample(File(file_path), source_url=source_url)
             if conf.cuckoo.delete_archive:
-                os.remove(file_path)
-
-        # Check for 'file' option indicating supporting files needed for upload; otherwise create task for each file
-        opts = get_options(options)
-        if "file" in opts:
-            runfile = opts["file"].lower()
-            if isinstance(runfile, str):
-                runfile = runfile.encode()
-            for xfile in extracted_files:
-                if runfile in xfile.lower():
-                    extracted_files = [xfile]
-                    break
+                path_delete(file_path.decode())
 
         # create tasks for each file in the archive
         for file in extracted_files:
@@ -1598,32 +1675,22 @@ class Database(object, metaclass=Singleton):
 
             if not config and not only_extraction:
                 if not package:
-                    f = SflockFile.from_path(file)
+                    package, tmp_package = self._identify_aux_func(file, "")
 
-                    try:
-                        tmp_package = sflock_identify(f)
-                    except Exception as e:
-                        log.error(f"Failed to sflock_ident due to {e}")
-                        tmp_package = "generic"
-
-                    if tmp_package and tmp_package in sandbox_packages:
-                        package = tmp_package
-                    else:
+                    if not tmp_package:
                         log.info("Do sandbox packages need an update? Sflock identifies as: %s - %s", tmp_package, file)
-                    del f
-                    if package == "dll" and "function" not in options:
-                        dll_export = PortableExecutable(file).choose_dll_export()
-                        if dll_export == "DllRegisterServer":
-                            package = "regsvr"
-                        elif dll_export == "xlAutoOpen":
-                            package = "xls"
-                        elif dll_export:
-                            if options:
-                                options += f",function={dll_export}"
-                            else:
-                                options = f"function={dll_export}"
-                    if package in ["iso", "udf", "vhd"]:
-                        package = "archive"
+
+                if package == "dll" and "function" not in options:
+                    dll_export = PortableExecutable(file.decode()).choose_dll_export()
+                    if dll_export == "DllRegisterServer":
+                        package = "regsvr"
+                    elif dll_export == "xlAutoOpen":
+                        package = "xls"
+                    elif dll_export:
+                        if options:
+                            options += f",function={dll_export}"
+                        else:
+                            options = f"function={dll_export}"
 
                 # ToDo better solution? - Distributed mode here:
                 # Main node is storage so try to extract before submit to vm isn't propagated to workers
@@ -1660,6 +1727,7 @@ class Database(object, metaclass=Singleton):
                     user_id=user_id,
                     username=username,
                 )
+                package = None
             if task_id:
                 task_ids.append(task_id)
 
@@ -1749,7 +1817,7 @@ class Database(object, metaclass=Singleton):
         if extracted_files and file_path not in extracted_files:
             sample_parent_id = self.register_sample(File(file_path))
             if conf.cuckoo.delete_archive:
-                os.remove(file_path)
+                path_delete(file_path)
 
         task_ids = []
         # create tasks for each file in the archive
@@ -1835,6 +1903,8 @@ class Database(object, metaclass=Singleton):
             timeout = 0
         if not priority:
             priority = 1
+        if not package:
+            package = web_conf.url_analysis.package
 
         return self.add(
             URL(url),
@@ -1907,8 +1977,8 @@ class Database(object, metaclass=Singleton):
 
             # All other task types have a "target" pointing to a temp location,
             # so get a stable path "target" based on the sample hash.
-            paths = self.sample_path_by_hash(task.sample.sha256)
-            paths = [x for x in paths if os.path.exists(x)]
+            paths = self.sample_path_by_hash(task.sample.sha256, task_id)
+            paths = [file_path for file_path in paths if path_exists(file_path)]
             if not paths:
                 return None
 
@@ -2002,25 +2072,6 @@ class Database(object, metaclass=Singleton):
             session.close()
 
         return uniq
-
-    @classlock
-    def list_parents(self, parent_id):
-        """
-        Retrieve tasks created by ID
-        @param parent_id: filter tasks created by parent ID
-        """
-        session = self.Session()
-        try:
-            tasks = session.query(Task).filter(Task.parent_id == parent_id).all()
-            if tasks:
-                return [[task.id, task.package] for task in tasks]
-            else:
-                return []
-        except SQLAlchemyError as e:
-            log.debug("Database error listing tasks: %s", e)
-            return []
-        finally:
-            session.close()
 
     @classlock
     def list_sample_parent(self, sample_id=False, task_id=False):
@@ -2145,7 +2196,7 @@ class Database(object, metaclass=Singleton):
                 search = search.order_by(Task.added_on.desc())
 
             tasks = search.limit(limit).offset(offset).all()
-            # session.expunge_all()
+            session.expunge_all()
             return tasks
         except RuntimeError as e:
             # RuntimeError: number of values in row (1) differ from number of column processors (62)
@@ -2171,15 +2222,14 @@ class Database(object, metaclass=Singleton):
         try:
             _min = session.query(func.min(Task.started_on).label("min")).first()
             _max = session.query(func.max(Task.completed_on).label("max")).first()
-            if _min and _max:
+            if _min and _max and _min[0] and _max[0]:
                 return int(_min[0].strftime("%s")), int(_max[0].strftime("%s"))
-            else:
-                return 0
         except SQLAlchemyError as e:
             log.debug("Database error counting tasks: %s", e)
-            return 0
         finally:
             session.close()
+
+        return 0, 0
 
     @classlock
     def get_tlp_tasks(self):
@@ -2208,9 +2258,7 @@ class Database(object, metaclass=Singleton):
         session = self.Session()
         try:
             unfiltered = session.query(Sample.file_type).group_by(Sample.file_type)
-            res = []
-            for asample in unfiltered.all():
-                res.append(asample[0])
+            res = [asample[0] for asample in unfiltered.all()]
             res.sort()
         except SQLAlchemyError as e:
             log.debug("Database error getting file_types: %s", e)
@@ -2332,7 +2380,7 @@ class Database(object, metaclass=Singleton):
     def delete_tasks(self, ids):
         session = self.Session()
         try:
-            search = session.query(Task).filter(Task.id.in_(ids)).delete(synchronize_session=False)
+            _ = session.query(Task).filter(Task.id.in_(ids)).delete(synchronize_session=False)
         except SQLAlchemyError as e:
             log.debug("Database error deleting task: %s", e)
             session.rollback()
@@ -2400,9 +2448,31 @@ class Database(object, metaclass=Singleton):
         return sample
 
     @classlock
-    def sample_path_by_hash(self, sample_hash):
+    def sample_still_used(self, sample_hash: str, task_id: int):
+        """Retrieve information if sample is used by another task(s).
+        @param hash: md5/sha1/sha256/sha256.
+        @param task_id: task_id
+        @return: bool
+        """
+        session = self.Session()
+        db_sample = (
+            session.query(Sample)
+            .options(joinedload("tasks"))
+            .filter(Sample.sha256 == sample_hash)
+            .filter(Task.id != task_id)
+            .filter(Sample.id == Task.sample_id)
+            .filter(Task.status.in_((TASK_PENDING, TASK_RUNNING, TASK_DISTRIBUTED)))
+            .first()
+        )
+        still_used = bool(db_sample)
+        session.close()
+        return still_used
+
+    @classlock
+    def sample_path_by_hash(self, sample_hash: str = False, task_id: int = False):
         """Retrieve information on a sample location by given hash.
         @param hash: md5/sha1/sha256/sha256.
+        @param task_id: task_id
         @return: samples path(s) as list.
         """
         sizes = {
@@ -2425,17 +2495,43 @@ class Database(object, metaclass=Singleton):
             "procdump": "procdump",
         }
 
+        if task_id:
+            file_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "binary")
+            if path_exists(file_path):
+                return [file_path]
+
+        session = False
+        # binary also not stored in binaries, perform hash lookup
+        if task_id and not sample_hash:
+            session = self.Session()
+            db_sample = (
+                session.query(Sample)
+                .options(joinedload("tasks"))
+                .filter(Task.id == task_id)
+                .filter(Sample.id == Task.sample_id)
+                .first()
+            )
+            if db_sample:
+                path = os.path.join(CUCKOO_ROOT, "storage", "binaries", db_sample.sha256)
+                if path_exists(path):
+                    return [path]
+
+                sample_hash = db_sample.sha256
+
+        if not sample_hash:
+            return []
+
         query_filter = sizes.get(len(sample_hash), "")
         sample = []
         # check storage/binaries
         if query_filter:
-            session = self.Session()
             try:
-
+                if not session:
+                    session = self.Session()
                 db_sample = session.query(Sample).filter(query_filter == sample_hash).first()
                 if db_sample is not None:
                     path = os.path.join(CUCKOO_ROOT, "storage", "binaries", db_sample.sha256)
-                    if os.path.exists(path):
+                    if path_exists(path):
                         sample = [path]
 
                 if not sample:
@@ -2461,7 +2557,7 @@ class Database(object, metaclass=Singleton):
                         for task in tasks:
                             for block in task.get("CAPE", {}).get("payloads", []) or []:
                                 if block[sizes_mongo.get(len(sample_hash), "")] == sample_hash:
-                                    path = os.path.join(
+                                    file_path = os.path.join(
                                         CUCKOO_ROOT,
                                         "storage",
                                         "analyses",
@@ -2469,8 +2565,8 @@ class Database(object, metaclass=Singleton):
                                         folders.get("CAPE"),
                                         block["sha256"],
                                     )
-                                    if os.path.exists(path):
-                                        sample = [path]
+                                    if path_exists(file_path):
+                                        sample = [file_path]
                                         break
                             if sample:
                                 break
@@ -2499,7 +2595,7 @@ class Database(object, metaclass=Singleton):
                             for task in tasks:
                                 for block in task.get(category, []) or []:
                                     if block[sizes_mongo.get(len(sample_hash), "")] == sample_hash:
-                                        path = os.path.join(
+                                        file_path = os.path.join(
                                             CUCKOO_ROOT,
                                             "storage",
                                             "analyses",
@@ -2507,8 +2603,8 @@ class Database(object, metaclass=Singleton):
                                             folders.get(category),
                                             block["sha256"],
                                         )
-                                        if os.path.exists(path):
-                                            sample = [path]
+                                        if path_exists(file_path):
+                                            sample = [file_path]
                                             break
                                 if sample:
                                     break
@@ -2519,7 +2615,7 @@ class Database(object, metaclass=Singleton):
                     if db_sample is not None:
                         samples = [_f for _f in [tmp_sample.to_dict().get("target", "") for tmp_sample in db_sample] if _f]
                         # hash validation and if exist
-                        samples = [path for path in samples if os.path.exists(path)]
+                        samples = [file_path for file_path in samples if path_exists(file_path)]
                         for path in samples:
                             with open(path, "rb").read() as f:
                                 if sample_hash == sizes[len(sample_hash)](f).hexdigest():
@@ -2547,10 +2643,10 @@ class Database(object, metaclass=Singleton):
                     if tasks:
                         for task in tasks:
                             for item in task["suricata"]["files"] or []:
-                                path = item["file_info"]["path"]
-                                if sample_hash in path:
-                                    if os.path.exists(path):
-                                        sample = [path]
+                                file_path = item["file_info"]["path"]
+                                if sample_hash in file_path:
+                                    if path_exists(file_path):
+                                        sample = [file_path]
                                         break
 
             except AttributeError:
@@ -2662,7 +2758,7 @@ class Database(object, metaclass=Singleton):
         session = self.Session()
         _ = (
             session.query(Task)
-            .filter(Task.user_id == int(user_id))
+            .filter(Task.user_id == user_id)
             .filter(Task.status == TASK_PENDING)
             .update({Task.status: TASK_BANNED}, synchronize_session=False)
         )

@@ -3,12 +3,14 @@ import logging
 import os
 import tempfile
 from collections.abc import Iterable, Mapping
+from pathlib import Path
 from types import ModuleType
 from typing import Dict, Tuple
 
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.common.objects import File
+from lib.cuckoo.common.path_utils import path_exists, path_read_file
 
 try:
     import yara
@@ -16,6 +18,15 @@ try:
     HAVE_YARA = True
 except ImportError:
     HAVE_YARA = False
+
+try:
+    import pydeep
+
+    ssdeep_threshold = 95
+    HAVE_PYDEEP = True
+except ImportError:
+    HAVE_PYDEEP = False
+
 
 cape_malware_parsers = {}
 
@@ -120,14 +131,6 @@ if process_cfg.CAPE_extractors.enabled:
         HAVE_CAPE_EXTRACTORS = True
     assert "test cape" in cape_malware_parsers
 
-try:
-    from modules.processing.parsers.plugxconfig import plugx
-
-    plugx_parser = plugx.PlugXConfig()
-except ImportError as e:
-    plugx_parser = False
-    log.error(e)
-
 suppress_parsing_list = ["Cerber", "Emotet_Payload", "Ursnif", "QakBot"]
 
 pe_map = {
@@ -152,7 +155,7 @@ def init_yara():
     for category in categories:
         # Check if there is a directory for the given category.
         category_root = os.path.join(yara_root, category)
-        if not os.path.exists(category_root):
+        if not path_exists(category_root):
             log.warning("Missing Yara directory: %s?", category_root)
             continue
 
@@ -176,14 +179,14 @@ def init_yara():
                 break
             except yara.SyntaxError as e:
                 bad_rule = f"{str(e).split('.yar', 1)[0]}.yar"
-                log.debug("Trying to delete bad rule: %s", bad_rule)
+                log.debug("Trying to disable rule: %s. Can't compile it. Ensure that your YARA is properly installed.", bad_rule)
                 if os.path.basename(bad_rule) not in indexed:
                     break
                 for k, v in rules.items():
                     if v == bad_rule:
                         del rules[k]
                         indexed.remove(os.path.basename(bad_rule))
-                        print(f"Deleted broken yara rule: {bad_rule}")
+                        log.error("Can't compile YARA rule: %s. Maybe is bad yara but can be missing module.", bad_rule)
                         break
             except yara.Error as e:
                 log.error("There was a syntax error in one or more Yara rules: %s", e)
@@ -239,8 +242,27 @@ def convert(data):
         return dict(list(map(convert, data.items())))
     elif isinstance(data, Iterable):
         return type(data)(list(map(convert, data)))
-    else:
-        return data
+    return data
+
+
+def is_duplicated_binary(file_info: dict, cape_file: dict, append_file: bool) -> bool:
+    if HAVE_PYDEEP:
+        ssdeep_grade = pydeep.compare(file_info["ssdeep"].encode(), cape_file["ssdeep"].encode())
+        if ssdeep_grade >= ssdeep_threshold:
+            log.debug("Duplicate payload skipped: ssdeep grade %d, threshold %d", ssdeep_grade, ssdeep_threshold)
+            append_file = False
+    if not file_info.get("pe") or not cape_file.get("pe"):
+        return append_file
+    if file_info["pe"].get("entrypoint") and file_info["pe"].get("ep_bytes") and cape_file["pe"].get("entrypoint"):
+        if (
+            file_info["pe"]["entrypoint"] == cape_file["pe"]["entrypoint"]
+            and file_info["cape_type_code"] == cape_file["cape_type_code"]
+            and file_info["pe"]["ep_bytes"] == cape_file["pe"]["ep_bytes"]
+        ):
+            log.debug("CAPE duplicate output file skipped: matching entrypoint")
+            append_file = False
+
+    return append_file
 
 
 def static_config_parsers(cape_name, file_path, file_data):
@@ -275,7 +297,7 @@ def static_config_parsers(cape_name, file_path, file_data):
                     cape_config[cape_name].update({key: [value]})
                 parser_loaded = True
         except Exception as e:
-            log.error("CAPE: parsing error on %s with %s: %s", file_path, cape_name, e)
+            log.error("CAPE: parsing error on %s with %s: %s", file_path, cape_name, e, exc_info=True)
 
     # DC3-MWCP
     if HAS_MWCP and not parser_loaded and cape_name and cape_name in malware_parsers:
@@ -310,7 +332,7 @@ def static_config_parsers(cape_name, file_path, file_data):
                 "CAPE: DC3-MWCP config parsing error on %s with %s: %s",
                 file_path,
                 cape_name,
-                e,
+                str(e),
             )
 
     elif HAS_MALWARECONFIGS and not parser_loaded and cape_name in __decoders__:
@@ -346,7 +368,7 @@ def static_config_parsers(cape_name, file_path, file_data):
                     "malwareconfig parsing error for %s with %s: %s, you should submit issue/fix to https://github.com/kevthehermit/RATDecoders/",
                     file_path,
                     cape_name,
-                    e,
+                    str(e),
                 )
 
         if cape_config.get(cape_name) == {}:
@@ -405,26 +427,32 @@ def static_config_lookup(file_path, sha256=False):
         return document_dict["info"]
 
 
+# add your families here, should match file name as in cape yara
+named_static_extractors = []
+
+
 def static_extraction(path):
+    config = False
     try:
         if not File.yara_initialized:
             init_yara()
         hits = File(path).get_yara(category="CAPE")
-        if not hits:
+        path_name = Path(path).name
+        if not hits and path_name not in named_static_extractors:
             return False
-        # Get the file data
-        with open(path, "rb") as file_open:
-            file_data = file_open.read()
-        for hit in hits:
-            cape_name = File.get_cape_name_from_yara_hit(hit)
-            config = static_config_parsers(cape_name, path, file_data)
-            if config:
-                return config
-        return False
+        file_data = path_read_file(path)
+        if path_name in named_static_extractors:
+            config = static_config_parsers(path_name, path, file_data)
+        else:
+            for hit in hits:
+                cape_name = File.get_cape_name_from_yara_hit(hit)
+                config = static_config_parsers(cape_name, path, file_data)
+                if config:
+                    break
     except Exception as e:
         log.error(e)
 
-    return False
+    return config
 
 
 def cape_name_from_yara(details, pid, results):

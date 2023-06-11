@@ -19,19 +19,18 @@ import sys
 from datetime import datetime
 
 import sqlalchemy as sa
-from alembic import op
 
 try:
     from dateutil.parser import parse
 except ImportError:
     print("Unable to import dateutil.parser", end=" ")
-    print("(install with `pip3 install python-dateutil`)")
+    print("(install with `poetry run pip install python-dateutil`)")
     sys.exit()
 
 try:
     from alembic import op
 except ImportError:
-    print("Unable to import alembic (install with `pip3 install alembic`)")
+    print("Unable to import alembic (install with `poetry run pip install alembic`)")
     sys.exit()
 
 curdir = os.path.abspath(os.path.dirname(__file__))

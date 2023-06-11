@@ -4,10 +4,11 @@
 
 import logging
 import os
+import re
+from contextlib import suppress
 
-from elasticsearch.helpers import parallel_bulk
+from lib.cuckoo.common.path_utils import path_exists
 
-from dev_utils.elasticsearchdb import get_daily_calls_index
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.objects import File
 
@@ -19,6 +20,10 @@ CHUNK_CALL_SIZE = 100
 
 if repconf.mongodb.enabled:
     from dev_utils.mongodb import mongo_insert_one
+elif repconf.elasticsearchdb.enabled:
+    from elasticsearch.helpers import parallel_bulk
+
+    from dev_utils.elasticsearchdb import get_daily_calls_index
 
 
 def ensure_valid_utf8(obj):
@@ -60,15 +65,15 @@ def get_json_document(results, analysis_path):
     # Add screenshot paths
     report["shots"] = []
     shots_path = os.path.join(analysis_path, "shots")
-    if os.path.exists(shots_path):
-        shots = [shot for shot in os.listdir(shots_path) if shot.endswith(".jpg")]
+    if path_exists(shots_path):
+        shots = [shot for shot in os.listdir(shots_path) if shot.endswith((".jpg", ".png"))]
         for shot_file in sorted(shots):
             shot_path = os.path.join(analysis_path, "shots", shot_file)
             screenshot = File(shot_path)
             if screenshot.valid():
                 # Strip the extension as it's added later
                 # in the Django view
-                report["shots"].append(shot_file.replace(".jpg", ""))
+                report["shots"].append(re.sub(r"\.(png|jpg)$", "", shot_file))
 
     # Calculate the mlist_cnt for display if present to reduce db load
     for entry in results.get("signatures", []) or []:
@@ -92,7 +97,7 @@ def get_json_document(results, analysis_path):
 def chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
     for i in range(0, len(lst), n):
-        yield lst[i:i + n]
+        yield lst[i : i + n]
 
 
 def insert_calls(report, elastic_db=None, mongodb=False):
@@ -111,13 +116,12 @@ def insert_calls(report, elastic_db=None, mongodb=False):
         # Loop on each process call.
         if mongodb:
             for _, call in enumerate(process["calls"]):
+                chunk_id = None
                 # If the chunk size is CHUNK_CALL_SIZE or if the loop is completed then store the chunk in DB.
                 if len(chunk) == CHUNK_CALL_SIZE:
                     to_insert = {"pid": process["process_id"], "calls": chunk}
-                    try:
+                    with suppress(Exception):
                         chunk_id = mongo_insert_one("calls", to_insert).inserted_id
-                    except Exception as e:
-                        chunk_id = None
 
                     if chunk_id:
                         chunks_ids.append(chunk_id)
@@ -128,11 +132,10 @@ def insert_calls(report, elastic_db=None, mongodb=False):
 
             # Store leftovers.
             if chunk:
+                chunk_id = None
                 to_insert = {"pid": process["process_id"], "calls": chunk}
-                try:
+                with suppress(Exception):
                     chunk_id = mongo_insert_one("calls", to_insert).inserted_id
-                except Exception as e:
-                    chunk_id = None
 
                 if chunk_id:
                     chunks_ids.append(chunk_id)
@@ -142,20 +145,14 @@ def insert_calls(report, elastic_db=None, mongodb=False):
             def gendata(p_call_chunks, process_id):
                 for call_chunk in p_call_chunks:
                     yield {
-                        '_index': get_daily_calls_index(),
-                        '_op_type': 'index',
-                        '_source': {
-                            "pid": process_id,
-                            "calls": call_chunk
-                        }
+                        "_index": get_daily_calls_index(),
+                        "_op_type": "index",
+                        "_source": {"pid": process_id, "calls": call_chunk},
                     }
 
-            for res in parallel_bulk(
-                elastic_db,
-                gendata(chunks(process["calls"], CHUNK_CALL_SIZE), process["process_id"])
-            ):
+            for res in parallel_bulk(elastic_db, gendata(chunks(process["calls"], CHUNK_CALL_SIZE), process["process_id"])):
                 if res[0]:
-                    chunks_ids.append(res[1]['index']['_id'])
+                    chunks_ids.append(res[1]["index"]["_id"])
 
         # Add list of chunks.
         new_process["calls"] = chunks_ids

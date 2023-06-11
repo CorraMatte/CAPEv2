@@ -29,11 +29,10 @@ def index(request, task_id, session_data):
 
     if state:
         if state[0] == 1:
-            status = "RUNNING"
             vmXml = dom.XMLDesc(0)
             root = ET.fromstring(vmXml)
-            graphics = root.find("./devices/graphics")
-            vncport = graphics.get("port")
+            graphics = root.find('./devices/graphics[@type="vnc"]')
+            vncport = graphics.get("port") if graphics else None
             return render(
                 request,
                 "guac/index.html",

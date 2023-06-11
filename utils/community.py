@@ -7,10 +7,11 @@ import os
 import shutil
 import sys
 import zipfile
-from io import BytesIO
+from contextlib import suppress
 
-if sys.version_info[:2] < (3, 6):
-    sys.exit("You are running an incompatible version of Python, please use >= 3.6")
+if sys.version_info[:2] < (3, 8):
+    sys.exit("You are running an incompatible version of Python, please use >= 3.8")
+
 import argparse
 import logging
 import tarfile
@@ -22,23 +23,27 @@ sys.path.append(os.path.join(os.path.abspath(os.path.dirname(__file__)), ".."))
 
 import lib.cuckoo.common.colors as colors
 from lib.cuckoo.common.constants import CUCKOO_ROOT
+from lib.cuckoo.common.integrations.mitre import mitre_update
+from lib.cuckoo.common.path_utils import path_exists, path_mkdir
 
 blocklist = {}
-if os.path.exists(os.path.join(CUCKOO_ROOT, "utils", "community_blocklist.py")):
+if path_exists(os.path.join(CUCKOO_ROOT, "utils", "community_blocklist.py")):
     from utils.community_blocklist import blocklist
 
 log = logging.getLogger(__name__)
-URL = "https://github.com/kevoreilly/community/archive/{0}.tar.gz"
 
 
-def flare_capa():
+def flare_capa(proxy=None):
     signature_urls = (
         "https://github.com/mandiant/capa/raw/master/sigs/1_flare_msvc_rtf_32_64.sig",
         "https://github.com/mandiant/capa/raw/master/sigs/2_flare_msvc_atlmfc_32_64.sig",
         "https://github.com/mandiant/capa/raw/master/sigs/3_flare_common_libs.sig",
     )
     try:
-        http = urllib3.PoolManager()
+        if proxy:
+            http = urllib3.ProxyManager(proxy)
+        else:
+            http = urllib3.PoolManager()
         data = http.request("GET", "https://github.com/mandiant/capa-rules/archive/master.zip").data
         dest_folder = os.path.join(CUCKOO_ROOT, "data")
         shutil.rmtree((os.path.join(dest_folder, "capa-rules-master")), ignore_errors=True)
@@ -47,9 +52,9 @@ def flare_capa():
         os.rename(os.path.join(dest_folder, "capa-rules-master"), os.path.join(dest_folder, "capa-rules"))
 
         # shutil.rmtree((os.path.join(dest_folder, "capa-signatures")), ignore_errors=True)
-        capa_sigs_path = os.path.join(dest_folder, "capa-signatures")
+        capa_sigs_path = os.path.join(dest_folder, "flare-signatures")
         if not os.path.isdir(capa_sigs_path):
-            os.mkdir(capa_sigs_path)
+            path_mkdir(capa_sigs_path)
         for url in signature_urls:
             signature_name = url.rsplit("/", 1)[-1]
             with http.request("GET", url, preload_content=False) as sig, open(
@@ -62,48 +67,24 @@ def flare_capa():
         print(e)
 
 
-def mitre():
-    """Urls might change, for proper urls see https://github.com/swimlane/pyattck"""
-    try:
-        from pyattck import Attck
-    except ImportError:
-        print("Missed dependency: install pyattck library, see requirements for proper version")
-        return
-
-    mitre = Attck(
-        nested_subtechniques=True,
-        use_config=False,
-        save_config=False,
-        config_file_path=os.path.join(CUCKOO_ROOT, "data", "mitre", "config.yml"),
-        data_path=os.path.join(CUCKOO_ROOT, "data", "mitre"),
-        enterprise_attck_json="https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json",
-        pre_attck_json="https://raw.githubusercontent.com/mitre/cti/master/pre-attack/pre-attack.json",
-        mobile_attck_json="https://raw.githubusercontent.com/mitre/cti/master/mobile-attack/mobile-attack.json",
-        ics_attck_json="https://raw.githubusercontent.com/mitre/cti/master/ics-attack/ics-attack.json",
-        nist_controls_json="https://raw.githubusercontent.com/center-for-threat-informed-defense/attack-control-framework-mappings/master/frameworks/ATT%26CK-v9.0/nist800-53-r4/stix/nist800-53-r4-controls.json",
-        generated_attck_json="https://swimlane-pyattck.s3.us-west-2.amazonaws.com/generated_attck_data.json",
-        generated_nist_json="https://swimlane-pyattck.s3.us-west-2.amazonaws.com/attck_to_nist_controls.json",
-    )
-
-    print("[+] Updating MITRE datasets")
-    mitre.update()
-
-
-def install(enabled, force, rewrite, filepath, access_token=None):
-    if filepath and os.path.exists(filepath):
+def install(enabled, force, rewrite, filepath: str = False, access_token=None, proxy=False, url: str = False):
+    if filepath and path_exists(filepath):
         t = tarfile.TarFile.open(filepath, mode="r:gz")
     else:
-        print(f"Downloading modules from {URL}")
+        print(f"Downloading modules from {url}")
         try:
-            http = urllib3.PoolManager()
+            if proxy:
+                http = urllib3.ProxyManager(proxy)
+            else:
+                http = urllib3.PoolManager()
             if access_token is None:
-                data = http.request("GET", URL).data
-            elif "github" in URL:
+                data = http.request("GET", url).data
+            elif "github" in url:
                 data = http.request(
-                    "GET", URL, headers={"Authorization": f"token {access_token}", "User-Agent": "CAPEv2_sandbox"}
+                    "GET", url, headers={"Authorization": f"token {access_token}", "User-Agent": "CAPEv2_sandbox"}
                 ).data
             else:
-                data = http.request("GET", URL, headers={"PRIVATE-TOKEN": access_token}).data
+                data = http.request("GET", url, headers={"PRIVATE-TOKEN": access_token}).data
 
             if b"Not Found" == data:
                 print("You don't have permissions to access this repo")
@@ -121,6 +102,10 @@ def install(enabled, force, rewrite, filepath, access_token=None):
         "machinery": "modules/machinery",
         "analyzer": "analyzer",
         "data": "data",
+        "common": "lib/cuckoo/common",
+        "integrations": "lib/cuckoo/common/integrations",
+        "mitre": "data/mitre",
+        "yara": "data/yara",
     }
 
     members = t.getmembers()
@@ -144,11 +129,11 @@ def install(enabled, force, rewrite, filepath, access_token=None):
                 continue
 
             if member.isdir():
-                if not os.path.exists(filepath):
-                    os.mkdir(filepath)
+                if not path_exists(filepath):
+                    path_mkdir(filepath)
                 continue
 
-            if not rewrite and os.path.exists(filepath):
+            if not rewrite and path_exists(filepath):
                 print(f'File "{filepath}" already exists, {colors.yellow("skipped")}')
                 continue
 
@@ -156,7 +141,7 @@ def install(enabled, force, rewrite, filepath, access_token=None):
             dest_file = os.path.basename(filepath)
 
             if filepath in blocklist.get(category, []):
-                print(f'You have blacklisted file: {dest_file}. {colors.yellow("skipped")}')
+                print(f'You have blocklisted file: {dest_file}. {colors.yellow("skipped")}')
                 continue
 
             if not force:
@@ -167,24 +152,22 @@ def install(enabled, force, rewrite, filepath, access_token=None):
                         break
                     elif choice.lower() in ("n", "no"):
                         break
-                    else:
-                        continue
             else:
                 install = True
 
             if install:
-                if not os.path.exists(os.path.dirname(filepath)):
-                    os.makedirs(os.path.dirname(filepath))
+                if not path_exists(os.path.dirname(filepath)):
+                    path_mkdir(os.path.dirname(filepath))
 
                 print(f'File "{filepath}" {colors.green("installed")}')
                 open(filepath, "wb").write(t.extractfile(member).read())
 
 
 def main():
-    global URL
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-a", "--all", help="Download everything", action="store_true", required=False)
+    parser.add_argument("-cm", "--common", help="Download CAPE common modules", action="store_true", required=False)
     parser.add_argument("-e", "--feeds", help="Download CAPE feed modules", action="store_true", required=False)
     parser.add_argument("-s", "--signatures", help="Download CAPE signatures", action="store_true", required=False)
     parser.add_argument("-p", "--processing", help="Download processing modules", action="store_true", required=False)
@@ -192,6 +175,7 @@ def main():
     parser.add_argument("-r", "--reporting", help="Download reporting modules", action="store_true", required=False)
     parser.add_argument("-an", "--analyzer", help="Download analyzer modules/binaries/etc", action="store_true", required=False)
     parser.add_argument("-data", "--data", help="Download data items", action="store_true", required=False)
+    parser.add_argument("-i", "--integrations", help="Download integration items", action="store_true", required=False)
     parser.add_argument(
         "-f", "--force", help="Install files without confirmation", action="store_true", default=False, required=False
     )
@@ -205,18 +189,37 @@ def main():
     )
     parser.add_argument("--mitre", help="Download updated MITRE JSONS", action="store_true", default=False, required=False)
     parser.add_argument(
+        "--mitre-offline",
+        help="Download updated MITRE JSONS from community repo",
+        action="store_true",
+        default=False,
+        required=False,
+    )
+    parser.add_argument(
         "-u", "--url", help="Download community modules from the specified url", action="store", default=None, required=False
     )
     parser.add_argument(
         "-t", "--token", help="Access token to download private repositories", action="store", default=None, required=False
     )
+    parser.add_argument("--proxy", help="Proxy to use. Ex http://127.0.0.1:8080", action="store", required=False)
+    parser.add_argument("-y", "--yara", help="Download YARA rules", action="store_true", required=False)
     args = parser.parse_args()
 
-    URL = args.url or URL.format(args.branch)
     enabled = []
 
     if args.all:
-        enabled = ["feeds", "processing", "signatures", "reporting", "machinery", "analyzer", "data"]
+        enabled = [
+            "feeds",
+            "processing",
+            "signatures",
+            "reporting",
+            "machinery",
+            "analyzer",
+            "data",
+            "integrations",
+            "mitre",
+            "common",
+        ]
         flare_capa()
     else:
         if args.feeds:
@@ -231,16 +234,25 @@ def main():
             enabled.append("machinery")
         if args.analyzer:
             enabled.append("analyzer")
+        if args.common:
+            enabled.append("common")
+        # Data contains yara
         if args.data:
             enabled.append("data")
+        elif args.yara:
+            enabled.append("yara")
+        if args.integrations:
+            enabled.append("integrations")
+        if args.mitre_offline:
+            enabled.append("mitre")
 
     if args.capa_rules:
-        flare_capa()
+        flare_capa(args.proxy)
         if not enabled:
             return
 
     if args.mitre:
-        mitre()
+        mitre_update()
         if not enabled:
             return
 
@@ -249,11 +261,17 @@ def main():
         parser.print_help()
         return
 
-    install(enabled, args.force, args.rewrite, args.file, args.token)
+    install(
+        enabled,
+        args.force,
+        args.rewrite,
+        args.file,
+        args.token,
+        args.proxy,
+        args.url or f"https://github.com/kevoreilly/community/archive/{args.branch}.tar.gz",
+    )
 
 
 if __name__ == "__main__":
-    try:
+    with suppress(KeyboardInterrupt):
         main()
-    except KeyboardInterrupt:
-        pass

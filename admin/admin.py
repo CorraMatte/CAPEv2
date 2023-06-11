@@ -40,7 +40,7 @@ try:
     from paramiko.ssh_exception import BadHostKeyException
     from scp import SCPClient, SCPException
 except ImportError:
-    print("pip3 install -U paramiko scp")
+    print("poetry run pip install -U paramiko scp")
     sys.exit()
 
 try:
@@ -49,7 +49,6 @@ try:
         CAPE_PATH,
         JUMP_BOX,
         JUMP_BOX_PORT,
-        JUMP_BOX_USERNAME,
         MASTER_NODE,
         REMOTE_SERVER_USER,
         SERVERS_STATIC_LIST,

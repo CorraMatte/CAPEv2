@@ -18,13 +18,13 @@ from lib.cuckoo.common.exceptions import (
     CuckooGuestCriticalTimeout,
     CuckooGuestError,
     CuckooMachineError,
-    CuckooNetworkError,
     CuckooOperationalError,
 )
 from lib.cuckoo.common.integrations.parse_pe import PortableExecutable
 from lib.cuckoo.common.objects import File
+from lib.cuckoo.common.path_utils import path_delete, path_exists, path_mkdir
 from lib.cuckoo.common.utils import convert_to_printable, create_folder, free_space_monitor, get_memdump_path, load_categories
-from lib.cuckoo.core.database import TASK_COMPLETED, TASK_PENDING, Database, Task
+from lib.cuckoo.core.database import TASK_COMPLETED, TASK_FAILED_ANALYSIS, TASK_PENDING, Database, Task
 from lib.cuckoo.core.guest import GuestManager
 from lib.cuckoo.core.log import task_log_stop
 from lib.cuckoo.core.plugins import RunAuxiliary, list_plugins
@@ -39,7 +39,7 @@ try:
     network_interfaces = list(psutil.net_if_addrs().keys())
     HAVE_NETWORKIFACES = True
 except ImportError:
-    print("Missde dependency: pip3 install psutil")
+    print("Missed dependency: pip3 install psutil")
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +47,7 @@ machinery = None
 machine_lock = None
 latest_symlink_lock = threading.Lock()
 routing = Config("routing")
+enable_trim = int(Config("web").general.enable_trim)
 
 active_analysis_count = 0
 
@@ -95,7 +96,7 @@ class AnalysisManager(threading.Thread):
 
         # If the analysis storage folder already exists, we need to abort the
         # analysis or previous results will be overwritten and lost.
-        if os.path.exists(self.storage):
+        if path_exists(self.storage):
             log.error("Task #%s: Analysis results folder already exists at path '%s', analysis aborted", self.task.id, self.storage)
             return False
 
@@ -125,7 +126,7 @@ class AnalysisManager(threading.Thread):
 
     def store_file(self, sha256):
         """Store a copy of the file being analyzed."""
-        if not os.path.exists(self.task.target):
+        if not path_exists(self.task.target):
             log.error(
                 "Task #%s: The file to analyze does not exist at path '%s', analysis aborted",
                 self.task.id,
@@ -133,17 +134,15 @@ class AnalysisManager(threading.Thread):
             )
             return False
 
-        self.binary = os.path.join(CUCKOO_ROOT, "storage", "binaries", str(self.task.id), sha256)
-        copy_path = os.path.join(CUCKOO_ROOT, "storage", "binaries", sha256)
+        self.binary = os.path.join(CUCKOO_ROOT, "storage", "binaries", sha256)
 
-        if os.path.exists(self.binary):
+        if path_exists(self.binary):
             log.info("Task #%s: File already exists at '%s'", self.task.id, self.binary)
         else:
             # TODO: do we really need to abort the analysis in case we are not able to store a copy of the file?
             try:
-                create_folder(folder=os.path.join(CUCKOO_ROOT, "storage", "binaries", str(self.task.id)))
                 shutil.copy(self.task.target, self.binary)
-            except (IOError, shutil.Error) as e:
+            except (IOError, shutil.Error):
                 log.error(
                     "Task #%s: Unable to store file from '%s' to '%s', analysis aborted",
                     self.task.id,
@@ -152,21 +151,8 @@ class AnalysisManager(threading.Thread):
                 )
                 return False
 
-        if os.path.exists(copy_path):
-            log.info("Task #%s: File already exists at '%s'", self.task.id, copy_path)
-        else:
-            # TODO: do we really need to abort the analysis in case we are not able to store a copy of the file?
-            try:
-                shutil.copy(self.task.target, copy_path)
-            except (IOError, shutil.Error) as e:
-                log.error(
-                    "Task #%s: Unable to store file from '%s' to '%s', analysis aborted", self.task.id, self.task.target, copy_path
-                )
-                return False
-
         try:
             new_binary_path = os.path.join(self.storage, "binary")
-
             if hasattr(os, "symlink"):
                 os.symlink(self.binary, new_binary_path)
             else:
@@ -186,13 +172,14 @@ class AnalysisManager(threading.Thread):
 
             # If the user specified a specific machine ID, a platform to be
             # used or machine tags acquire the machine accordingly.
-            task_archs = [tag.name for tag in self.task.tags if tag.name in ["x86", "x64"]]
-            task_tags = [tag.name for tag in self.task.tags if tag.name not in task_archs]
+            task_archs, task_tags = self.db._task_arch_tags_helper(self.task)
+            os_version = self.db._package_vm_requires_check(self.task.package)
 
-            # In some cases it's possible that we enter this loop without
-            # having any available machines. We should make sure this is not
+            # In some cases it's possible that we enter this loop without having any available machines. We should make sure this is not
             # such case, or the analysis task will fail completely.
-            if not machinery.availables(machine_id=self.task.machine, platform=self.task.platform, tags=task_tags, arch=task_archs):
+            if not machinery.availables(
+                label=self.task.machine, platform=self.task.platform, tags=task_tags, arch=task_archs, os_version=os_version
+            ):
                 machine_lock.release()
                 log.debug(
                     "Task #%s: no machine available yet for machine '%s', platform '%s' or tags '%s'.",
@@ -204,7 +191,9 @@ class AnalysisManager(threading.Thread):
                 time.sleep(1)
                 continue
 
-            machine = machinery.acquire(machine_id=self.task.machine, platform=self.task.platform, tags=task_tags, arch=task_archs)
+            machine = machinery.acquire(
+                machine_id=self.task.machine, platform=self.task.platform, tags=task_tags, arch=task_archs, os_version=os_version
+            )
 
             # If no machine is available at this moment, wait for one second and try again.
             if not machine:
@@ -247,6 +236,7 @@ class AnalysisManager(threading.Thread):
             "terminate_processes": self.cfg.cuckoo.terminate_processes,
             "upload_max_size": self.cfg.resultserver.upload_max_size,
             "do_upload_max_size": int(self.cfg.resultserver.do_upload_max_size),
+            "enable_trim": enable_trim,
             "timeout": self.task.timeout or self.cfg.timeouts.default,
         }
 
@@ -265,7 +255,7 @@ class AnalysisManager(threading.Thread):
         return options
 
     def category_checks(self):
-        if self.task.category in ["file", "pcap", "static"]:
+        if self.task.category in ("file", "pcap", "static"):
             sha256 = File(self.task.target).get_sha256()
             # Check whether the file has been changed for some unknown reason.
             # And fail this analysis if it has been modified.
@@ -289,8 +279,8 @@ class AnalysisManager(threading.Thread):
             dirnames = ["logs", "files", "aux"]
             for dirname in dirnames:
                 try:
-                    os.makedirs(os.path.join(self.storage, dirname))
-                except Exception as e:
+                    path_mkdir(os.path.join(self.storage, dirname))
+                except Exception:
                     log.debug("Failed to create folder %s", dirname)
             return True
 
@@ -300,13 +290,6 @@ class AnalysisManager(threading.Thread):
         dead_machine = False
         self.socks5s = _load_socks5_operational()
 
-        log.info(
-            "Task #%s: Starting analysis of %s '%s'",
-            self.task.id,
-            self.task.category.upper(),
-            convert_to_printable(self.task.target),
-        )
-
         # Initialize the analysis folders.
         if not self.init_storage():
             log.debug("Failed to initialize the analysis folder")
@@ -315,6 +298,13 @@ class AnalysisManager(threading.Thread):
         category_early_escape = self.category_checks()
         if isinstance(category_early_escape, bool):
             return category_early_escape
+
+        log.info(
+            "Task #%s: Starting analysis of %s '%s'",
+            self.task.id,
+            self.task.category.upper(),
+            convert_to_printable(self.task.target),
+        )
 
         # Acquire analysis machine.
         try:
@@ -369,7 +359,7 @@ class AnalysisManager(threading.Thread):
 
             self.db.guest_set_status(self.task.id, "stopping")
             succeeded = True
-        except (CuckooMachineError, CuckooNetworkError) as e:
+        except CuckooMachineError as e:
             if not unlocked:
                 machine_lock.release()
             log.error(str(e), extra={"task_id": self.task.id}, exc_info=True)
@@ -487,10 +477,9 @@ class AnalysisManager(threading.Thread):
                 # Deal with race conditions using a lock.
                 latest_symlink_lock.acquire()
                 try:
-                    # As per documentation, lexists() returns True for dead
-                    # symbolic links.
+                    # As per documentation, lexists() returns True for dead symbolic links.
                     if os.path.lexists(latest):
-                        os.remove(latest)
+                        path_delete(latest)
 
                     os.symlink(self.storage, latest)
                 except OSError as e:
@@ -589,7 +578,10 @@ class AnalysisManager(threading.Thread):
 
         # check if the interface is up
         if HAVE_NETWORKIFACES and routing.routing.verify_interface and self.interface and self.interface not in network_interfaces:
-            raise CuckooNetworkError(f"Network interface {self.interface} not found")
+            log.info("Network interface {} not found, falling back to dropping network traffic", self.interface)
+            self.interface = None
+            self.rt_table = None
+            self.route = "drop"
 
         if self.interface:
             self.rooter_response = rooter("forward_enable", self.machine.interface, self.interface, self.machine.ip)
@@ -605,7 +597,7 @@ class AnalysisManager(threading.Thread):
                 )
                 self._rooter_response_check()
 
-        log.info("Enabled route '%s'", self.route)
+        log.info("Enabled route '%s'.", self.route)
 
         if self.rt_table:
             self.rooter_response = rooter("srcroute_enable", self.rt_table, self.machine.ip)
@@ -720,7 +712,7 @@ class Scheduler:
         # Find its configuration file.
         conf = os.path.join(CUCKOO_ROOT, "conf", f"{machinery_name}.conf")
 
-        if not os.path.exists(conf):
+        if not path_exists(conf):
             raise CuckooCriticalError(
                 f'The configuration file for machine manager "{machinery_name}" does not exist at path: {conf}'
             )
@@ -757,12 +749,9 @@ class Scheduler:
         for machine in machinery.machines():
             if not machine.interface:
                 log.info(
-                    "Unable to determine the network interface for VM "
-                    "with name %s, Cuckoo will not be able to give it "
-                    "full internet access or route it through a VPN! "
-                    "Please define a default network interface for the "
-                    "machinery or define a network interface for each "
-                    "VM",
+                    "Unable to determine the network interface for VM with name %s, Cuckoo will not be able to give it "
+                    "full internet access or route it through a VPN! Please define a default network interface for the "
+                    "machinery or define a network interface for each VM",
                     machine.name,
                 )
                 continue
@@ -839,7 +828,7 @@ class Scheduler:
             # If no machines are available, it's pointless to fetch for pending tasks. Loop over.
             # But if we analyze pcaps/static only it's fine
             # ToDo verify that it works with static and file/url
-            if self.categories_need_VM and not machinery.availables():
+            if self.categories_need_VM and not machinery.availables(include_reserved=True):
                 continue
             # Exits if max_analysis_count is defined in the configuration
             # file and has been reached.
@@ -856,6 +845,13 @@ class Scheduler:
                     for task in self.db.list_tasks(
                         status=TASK_PENDING, order_by=(Task.priority.desc(), Task.added_on), options_not_like="node="
                     ):
+                        # Can this task ever be serviced?
+                        if not self.db.is_serviceable(task):
+                            if self.cfg.cuckoo.fail_unserviceable:
+                                log.debug("Task #%s: Failing unserviceable task", task.id)
+                                self.db.set_status(task.id, TASK_FAILED_ANALYSIS)
+                                continue
+                            log.debug("Task #%s: Unserviceable task", task.id)
                         relevant_machine_is_available = self.db.is_relevant_machine_available(task)
                         if relevant_machine_is_available:
                             break

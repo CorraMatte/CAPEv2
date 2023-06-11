@@ -18,7 +18,6 @@ AUTHOR = "kevoreilly"
 import string
 
 import pefile
-import yara
 from Cryptodome.Cipher import ARC4
 
 rule_source = """
@@ -45,8 +44,7 @@ def convert_char(c) -> str:
         c = chr(c)
     if c in string.printable:
         return c
-    else:
-        return f"\\x{ord(c):02x}"
+    return f"\\x{ord(c):02x}"
 
 
 def decrypt_rc4(key, data):

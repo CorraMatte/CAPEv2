@@ -9,9 +9,9 @@ import hashlib
 import logging
 import mmap
 import os
-import re
 import struct
 import subprocess
+from pathlib import Path
 from typing import Any, Dict
 
 from lib.cuckoo.common.cape_utils import init_yara
@@ -43,13 +43,6 @@ except ImportError:
     HAVE_PYDEEP = False
 
 try:
-    import yara
-
-    HAVE_YARA = True
-except ImportError:
-    HAVE_YARA = False
-
-try:
     import pyclamd
 
     HAVE_CLAMAV = True
@@ -77,8 +70,6 @@ except ImportError:
     HAVE_TLSH = False
 
 log = logging.getLogger(__name__)
-
-FILE_CHUNK_SIZE = 16 * 1024
 
 yara_error = {
     "1": "ERROR_INSUFFICIENT_MEMORY",
@@ -131,6 +122,15 @@ yara_error = {
     "49": "ERROR_REGULAR_EXPRESSION_TOO_COMPLEX",
 }
 
+type_list = [
+    "RAR self-extracting archive",
+    "Nullsoft Installer self-extracting archive",
+    "7-zip Installer data",
+    "Inno Setup",
+    "MSI Installer",
+    "Microsoft Cabinet",  # ToDo add die support here
+]
+
 
 class Dictionary(dict):
     """Cuckoo custom dict."""
@@ -173,7 +173,9 @@ class File:
         """@param file_path: file path."""
         self.file_name = file_name
         self.file_path = file_path
+        self.file_path_ansii = file_path if isinstance(file_path, str) else file_path.decode()
         self.guest_paths = guest_paths
+        self.path_object = Path(self.file_path_ansii)
 
         # these will be populated when first accessed
         self._file_data = None
@@ -190,10 +192,10 @@ class File:
         """Get file name.
         @return: file name.
         """
-        return self.file_name or os.path.basename(self.file_path)
+        return self.file_name or Path(self.file_path).name
 
     def valid(self):
-        return os.path.exists(self.file_path) and os.path.isfile(self.file_path) and os.path.getsize(self.file_path) != 0
+        return self.path_object.exists() and self.path_object.is_file() and self.path_object.stat().st_size
 
     def get_data(self):
         """Read file contents.
@@ -201,12 +203,12 @@ class File:
         """
         return self.file_data
 
-    def get_chunks(self):
+    def get_chunks(self, size=16):
         """Read file contents in chunks (generator)."""
-
+        chunk_size = size * 1024
         with open(self.file_path, "rb") as fd:
             while True:
-                chunk = fd.read(FILE_CHUNK_SIZE)
+                chunk = fd.read(chunk_size)
                 if not chunk:
                     break
                 yield chunk
@@ -233,7 +235,7 @@ class File:
             if HAVE_TLSH:
                 tlsh_hash.update(chunk)
 
-        self._crc32 = "".join(f"{(crc >> i) & 0xFF:02X}" for i in [24, 16, 8, 0])
+        self._crc32 = "".join(f"{(crc >> i) & 0xFF:02X}" for i in (24, 16, 8, 0))
         self._md5 = md5.hexdigest()
         self._sha1 = sha1.hexdigest()
         self._sha256 = sha256.hexdigest()
@@ -247,15 +249,15 @@ class File:
     @property
     def file_data(self):
         if not self._file_data:
-            if os.path.exists(self.file_path):
-                self._file_data = open(self.file_path, "rb").read()
+            if self.path_object.exists():
+                self._file_data = self.path_object.read_bytes()
         return self._file_data
 
     def get_size(self):
         """Get file size.
         @return: file size.
         """
-        return os.path.getsize(self.file_path) if os.path.exists(self.file_path) else 0
+        return self.path_object.stat().st_size if self.path_object.exists() else 0
 
     def get_crc32(self):
         """Get CRC32.
@@ -327,11 +329,11 @@ class File:
         @return: file content type.
         """
         file_type = None
-        if os.path.exists(self.file_path):
+        if self.path_object.exists():
             if HAVE_MAGIC:
                 if hasattr(magic, "from_file"):
                     try:
-                        file_type = magic.from_file(self.file_path)
+                        file_type = magic.from_file(self.file_path_ansii)
                     except Exception as e:
                         log.error(e, exc_info=True)
                 if not file_type and hasattr(magic, "open"):
@@ -374,22 +376,32 @@ class File:
                             is_dll = self.pe.is_dll()
                             is_x64 = self.pe.FILE_HEADER.Machine == IMAGE_FILE_MACHINE_AMD64
                             gui_type = "console" if self.pe.OPTIONAL_HEADER.Subsystem == 3 else "GUI"
+                            dotnet_string = ""
+                            with contextlib.suppress(AttributeError):
+                                dotnet_string = (
+                                    " Mono/.Net assembly"
+                                    if self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[
+                                        pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR"]
+                                    ].VirtualAddress
+                                    != 0
+                                    else ""
+                                )
                             # Emulate magic for now
                             if is_dll and is_x64:
-                                self.file_type = "PE32+ executable (DLL) (GUI) x86-64, for MS Windows"
+                                self.file_type = f"PE32+ executable (DLL) (GUI) x86-64{dotnet_string}, for MS Windows"
                             elif is_dll:
-                                self.file_type = "PE32 executable (DLL) (GUI) Intel 80386, for MS Windows"
+                                self.file_type = f"PE32 executable (DLL) (GUI) Intel 80386{dotnet_string}, for MS Windows"
                             elif is_x64:
-                                self.file_type = f"PE32+ executable ({gui_type}) x86-64, for MS Windows"
+                                self.file_type = f"PE32+ executable ({gui_type}) x86-64{dotnet_string}, for MS Windows"
                             else:
-                                self.file_type = f"PE32 executable ({gui_type}) Intel 80386, for MS Windows"
+                                self.file_type = f"PE32 executable ({gui_type}) Intel 80386{dotnet_string}, for MS Windows"
                     elif not File.notified_pefile:
                         File.notified_pefile = True
                         log.warning("Unable to import pefile (install with `pip3 install pefile`)")
             except Exception as e:
                 log.error(e, exc_info=True)
-            if not self.file_type:
-                self.file_type = self.get_content_type()
+        if not self.file_type:
+            self.file_type = self.get_content_type()
 
         return self.file_type
 
@@ -412,12 +424,6 @@ class File:
         init_yara()
 
         results = []
-        if not HAVE_YARA:
-            if not File.notified_yara:
-                File.notified_yara = True
-                log.warning("Unable to import yara (please compile from sources)")
-            return results
-
         if not os.path.getsize(self.file_path):
             return results
 
@@ -425,11 +431,8 @@ class File:
         for c in [category, 'custom']:
             try:
                 rule = File.yara_rules[c]
-                if isinstance(self.file_path, bytes):
-                    path = self.file_path.decode()
-                else:
-                    path = self.file_path
-                for match in rule.match(path, externals=externals):
+
+                for match in rule.match(self.file_path_ansii, externals=externals):
                     strings = {self._yara_encode_string(s[2]) for s in match.strings}
                     addresses = {s[1].strip("$"): s[0] for s in match.strings}
                     results.append(
@@ -507,7 +510,7 @@ class File:
         @return: TLSH.
         """
         if not hasattr(self, "_tlsh_hash"):
-            return False
+            return None
         if not self._tlsh_hash:
             self.calc_hashes()
         return self._tlsh_hash
@@ -557,6 +560,23 @@ class File:
         # Close PE file and return RichPE hash digest
         return md5.hexdigest()
 
+    def is_sfx(self):
+        filetype = self.get_content_type()
+        return any([ftype in filetype for ftype in type_list])
+
+    def get_all_hashes(self):
+        return {
+            "crc32": self.get_crc32(),
+            "md5": self.get_md5(),
+            "sha1": self.get_sha1(),
+            "sha256": self.get_sha256(),
+            "sha512": self.get_sha512(),
+            "rh_hash": self.get_rh_hash(),
+            "ssdeep": self.get_ssdeep(),
+            "tlsh": self.get_tlsh(),
+            "sha3_384": self.get_sha3_384(),
+        }
+
     def get_all(self):
         """Get all information available.
         @return: information dict.
@@ -574,7 +594,7 @@ class File:
             "sha512": self.get_sha512(),
             "rh_hash": self.get_rh_hash(),
             "ssdeep": self.get_ssdeep(),
-            "type": self.get_content_type(),
+            "type": self.get_type(),
             "yara": self.get_yara(),
             "cape_yara": self.get_yara(category="CAPE"),
             "clamav": self.get_clamav(),

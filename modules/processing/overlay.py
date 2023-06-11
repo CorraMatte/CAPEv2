@@ -3,12 +3,10 @@ import logging
 import os
 
 from lib.cuckoo.common.abstracts import Processing
-from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.objects import File
+from lib.cuckoo.common.path_utils import path_exists, path_mkdir, path_write_file
 
 log = logging.getLogger()
-
-processing_conf = Config("processing")
 
 
 class process_overlay_file(object):
@@ -18,10 +16,10 @@ class process_overlay_file(object):
         self.overlay_fullpath = overlay_fullpath
 
     def run(self):
-        if not processing_conf.overlay.enabled:
+        if not self.options.enabled:
             return {}
 
-        if not os.path.exists(self.overlay_fullpath):
+        if not path_exists(self.overlay_fullpath):
             return {}
 
         file_info, _ = File(file_path=self.overlay_fullpath).get_all()
@@ -57,13 +55,12 @@ class extract_overlay_data(Processing):
             output["pe"]["overlay"]["data"] = base64.b64encode(data[: min(overlay_size, 4096)])
 
             fld = os.path.join(self.analysis_path, "files")
-            if not os.path.exists(fld):
+            if not path_exists(fld):
                 log.warning("Folder not present, creating it. Might affect the displaying of (overlay) results on the web")
-                os.makedirs(fld)
+                path_mkdir(fld)
 
             fld = os.path.join(fld, "extracted_overlay")
-            with open(fld, "wb+") as f2:
-                f2.write(data)
+            _ = path_write_file(fld, data)
 
             output["pe"]["overlay"]["fileinfo"] = process_overlay_file(fld).run()
 

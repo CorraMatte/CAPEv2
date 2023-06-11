@@ -7,32 +7,53 @@ import os
 import shutil
 from tempfile import NamedTemporaryFile
 
+import pytest
+from sqlalchemy import delete
+
+from lib.cuckoo.common.path_utils import path_mkdir
 from lib.cuckoo.common.utils import store_temp_file
-from lib.cuckoo.core.database import Database, Task
+from lib.cuckoo.core.database import Database, Machine, Tag, Task
 
 
+@pytest.fixture(autouse=True)
+def storage(tmp_path, request):
+    storage = tmp_path / "storage"
+    binaries = storage / "binaries"
+    binaries.mkdir(mode=0o755, parents=True)
+    analyses = storage / "analyses"
+    analyses.mkdir(mode=0o755, parents=True)
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir(mode=0o755, parents=True)
+    request.instance.tmp_path = tmp_path
+    request.instance.storage = str(storage)
+    request.instance.binary_storage = str(binaries)
+    request.instance.analyses_storage = str(analyses)
+    request.instance.tmpdir = str(tmpdir)
+
+
+@pytest.mark.usefixtures("tmp_cuckoo_root")
 class TestDatabaseEngine:
     """Test database stuff."""
 
     URI = None
 
-    def setup_method(self):
-        with NamedTemporaryFile(mode="w+", delete=False) as f:
+    def setup_method(self, method):
+        with NamedTemporaryFile(mode="w+", delete=False, dir=self.storage) as f:
             f.write("hehe")
         self.temp_filename = f.name
         pcap_header_base64 = b"1MOyoQIABAAAAAAAAAAAAAAABAABAAAA"
         pcap_bytes = base64.b64decode(pcap_header_base64)
-        self.temp_pcap = store_temp_file(pcap_bytes, "%s.pcap" % f.name)
+        self.temp_pcap = store_temp_file(pcap_bytes, "%s.pcap" % f.name, self.tmpdir.encode())
         self.d = Database(dsn="sqlite://")
         # self.d.connect(dsn=self.URI)
         self.session = self.d.Session()
-        self.binary_storage = os.path.join(os.getcwd(), "storage/binaries")
-        os.makedirs(self.binary_storage)
+        stmt = delete(Machine)
+        self.session.execute(stmt)
+        self.session.commit()
 
     def teardown_method(self):
         del self.d
-        os.unlink(self.temp_filename)
-        shutil.rmtree(self.binary_storage)
+        shutil.rmtree(str(self.tmp_path))
 
     def add_url(self, url, priority=1, status="pending"):
         task_id = self.d.add_url(url, priority=priority)
@@ -82,8 +103,9 @@ class TestDatabaseEngine:
         assert task.category == "file"
 
         # write a real sample to storage
-        sample_path = os.path.join(self.binary_storage, task.sample.sha256)
-        shutil.copy(self.temp_filename, sample_path)
+        task_path = os.path.join(self.analyses_storage, str(task.id))
+        path_mkdir(task_path)
+        shutil.copy(self.temp_filename, os.path.join(task_path, "binary"))
 
         new_task_id = self.d.reschedule(task_id)
         assert new_task_id is not None
@@ -92,7 +114,9 @@ class TestDatabaseEngine:
 
     def test_reschedule_static(self):
         count = self.session.query(Task).count()
-        task_id = self.d.add_static(self.temp_filename)
+        task_ids = self.d.add_static(self.temp_filename)
+        assert len(task_ids) == 1
+        task_id = task_ids[0]
         assert self.session.query(Task).count() == count + 1
         task = self.d.view_task(task_id)
         assert task is not None
@@ -143,7 +167,7 @@ class TestDatabaseEngine:
     def test_add_machine(self):
         self.d.add_machine(
             name="name1",
-            label="label",
+            label="label1",
             ip="1.2.3.4",
             platform="windows",
             tags="tag1 tag2",
@@ -152,10 +176,11 @@ class TestDatabaseEngine:
             resultserver_ip="5.6.7.8",
             resultserver_port=2043,
             arch="x64",
+            reserved=False,
         )
         self.d.add_machine(
             name="name2",
-            label="label",
+            label="label2",
             ip="1.2.3.4",
             platform="windows",
             tags="tag1 tag2",
@@ -164,6 +189,7 @@ class TestDatabaseEngine:
             resultserver_ip="5.6.7.8",
             resultserver_port=2043,
             arch="x64",
+            reserved=True,
         )
         m1 = self.d.view_machine("name1")
         m2 = self.d.view_machine("name2")
@@ -175,7 +201,7 @@ class TestDatabaseEngine:
             "resultserver_ip": "5.6.7.8",
             "ip": "1.2.3.4",
             "tags": ["tag1tag2"],
-            "label": "label",
+            "label": "label1",
             "locked_changed_on": None,
             "platform": "windows",
             "snapshot": "snap0",
@@ -184,13 +210,14 @@ class TestDatabaseEngine:
             "id": 1,
             "resultserver_port": "2043",
             "arch": "x64",
+            "reserved": False,
         }
 
         assert m2.to_dict() == {
             "id": 2,
             "interface": "int0",
             "ip": "1.2.3.4",
-            "label": "label",
+            "label": "label2",
             "locked": False,
             "locked_changed_on": None,
             "name": "name2",
@@ -202,4 +229,39 @@ class TestDatabaseEngine:
             "status_changed_on": None,
             "tags": ["tag1tag2"],
             "arch": "x64",
+            "reserved": True,
         }
+
+    @pytest.mark.parametrize(
+        "reserved,requested_platform,requested_machine,is_serviceable",
+        (
+            (False, "windows", None, True),
+            (False, "linux", None, False),
+            (False, "windows", "label", True),
+            (False, "linux", "label", False),
+            (True, "windows", None, False),
+            (True, "linux", None, False),
+            (True, "windows", "label", True),
+            (True, "linux", "label", False),
+        ),
+    )
+    def test_serviceability(self, reserved, requested_platform, requested_machine, is_serviceable):
+        self.d.add_machine(
+            name="win10-x64-1",
+            label="label",
+            ip="1.2.3.4",
+            platform="windows",
+            tags="tag1",
+            interface="int0",
+            snapshot="snap0",
+            resultserver_ip="5.6.7.8",
+            resultserver_port=2043,
+            arch="x64",
+            reserved=reserved,
+        )
+        task = Task()
+        task.platform = requested_platform
+        task.machine = requested_machine
+        task.tags = [Tag("tag1")]
+        # tasks matching the available machines are serviceable
+        assert self.d.is_serviceable(task) is is_serviceable

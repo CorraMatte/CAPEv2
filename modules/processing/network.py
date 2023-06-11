@@ -17,6 +17,7 @@ import tempfile
 import traceback
 from base64 import b64encode
 from collections import OrderedDict, namedtuple
+from contextlib import suppress
 from hashlib import md5, sha1, sha256
 from itertools import islice
 from json import loads
@@ -32,6 +33,7 @@ from lib.cuckoo.common.dns import resolve
 from lib.cuckoo.common.exceptions import CuckooProcessingError
 from lib.cuckoo.common.irc import ircMessage
 from lib.cuckoo.common.objects import File
+from lib.cuckoo.common.path_utils import path_delete, path_exists, path_mkdir, path_read_file, path_write_file
 from lib.cuckoo.common.safelist import is_safelisted_domain
 from lib.cuckoo.common.utils import convert_to_printable
 
@@ -42,13 +44,12 @@ try:
 except ImportError:
     import re
 
-try:
-    import GeoIP
 
-    IS_GEOIP = True
-    gi = GeoIP.new(GeoIP.GEOIP_MEMORY_CACHE)
-except ImportError:
-    IS_GEOIP = False
+HAVE_GEOIP = False
+with suppress(ImportError):
+    import maxminddb
+
+    HAVE_GEOIP = True
 
 try:
     import dpkt
@@ -66,7 +67,7 @@ try:
     if httpreplay.__version__ == "0.3":
         HAVE_HTTPREPLAY = True
 except ImportError:
-    print("OPTIONAL! Missed dependency: pip3 install -U git+https://github.com/CAPESandbox/httpreplay")
+    print("OPTIONAL! Missed dependency: poetry run pip install -U git+https://github.com/CAPESandbox/httpreplay")
 except SystemError as e:
     print("httpreplay: %s", str(e))
 
@@ -93,19 +94,26 @@ logging.getLogger("httpreplay").setLevel(logging.CRITICAL)
 
 comment_re = re.compile(r"\s*#.*")
 if enabled_passlist and passlist_file:
-    with open(os.path.join(CUCKOO_ROOT, passlist_file), "r") as f:
-        for domain in f.readlines():
-            domain = comment_re.sub("", domain).strip()
-            if domain:
-                domain_passlist_re.append(domain)
+    f = path_read_file(os.path.join(CUCKOO_ROOT, passlist_file), mode="text")
+    for domain in f.splitlines():
+        domain = comment_re.sub("", domain).strip()
+        if domain:
+            domain_passlist_re.append(domain)
 
 ip_passlist = set()
 if enabled_ip_passlist and ip_passlist_file:
-    with open(os.path.join(CUCKOO_ROOT, ip_passlist_file), "r") as f:
-        for ip in f.readlines():
-            ip = comment_re.sub("", ip).strip()
-            if ip:
-                ip_passlist.add(ip)
+    f = path_read_file(os.path.join(CUCKOO_ROOT, ip_passlist_file), mode="text")
+    for ip in f.splitlines():
+        ip = comment_re.sub("", ip).strip()
+        if ip:
+            ip_passlist.add(ip)
+
+if HAVE_GEOIP and proc_cfg.network.maxmind_database:
+    maxmind_db_path = os.path.join(CUCKOO_ROOT, proc_cfg.network.maxmind_database)
+    if proc_cfg.network.country_lookup and path_exists(maxmind_db_path):
+        maxminddb_client = maxminddb.open_database(maxmind_db_path)
+    else:
+        HAVE_GEOIP = False
 
 
 class Pcap:
@@ -217,35 +225,27 @@ class Pcap:
             ("224.0.0.0", 4),
         )
 
-        try:
+        with suppress(Exception):
             ipaddr = struct.unpack(">I", socket.inet_aton(ip))[0]
             for netaddr, bits in networks:
                 network_low = struct.unpack(">I", socket.inet_aton(netaddr))[0]
                 network_high = network_low | (1 << (32 - bits)) - 1
                 if ipaddr <= network_high and ipaddr >= network_low:
                     return True
-        except Exception:
-            pass
-
-        return False
 
     def _get_cn(self, ip):
-        cn = "unknown"
-        log = logging.getLogger("Processing.Pcap")
-        if IS_GEOIP:
+        if HAVE_GEOIP:
             try:
-                temp_cn = gi.country_name_by_addr(ip)
-                if temp_cn:
-                    cn = temp_cn
+                return maxminddb_client.get(ip).get("country", {}).get("names", {}).get("en", "unknown")
             except Exception:
-                log.error("Unable to GEOIP resolve %s", ip)
-        return cn
+                log.error("Unable to resolve GEOIP for %s", ip)
+        return "unknown"
 
     def _add_hosts(self, connection):
         """Add IPs to unique list.
         @param connection: connection data
         """
-        try:
+        with suppress(Exception):
             if connection["dst"] not in self.hosts:
                 ip = convert_to_printable(connection["dst"])
 
@@ -259,8 +259,6 @@ class Pcap:
                     # first packet they appear in.
                     if not self._is_private_ip(ip):
                         self.unique_hosts.append(ip)
-        except Exception:
-            pass
 
     def _enrich_hosts(self, unique_hosts):
         enriched_hosts = []
@@ -275,10 +273,8 @@ class Pcap:
             inaddrarpa = ""
             hostname = ""
             if cfg.processing.reverse_dns:
-                try:
+                with suppress(Exception):
                     inaddrarpa = d.query(from_address(ip), "PTR").rrset[0].to_text()
-                except Exception:
-                    pass
             for request in self.dns_requests.values():
                 for answer in request["answers"]:
                     if answer["data"] == ip:
@@ -290,13 +286,14 @@ class Pcap:
             enriched_hosts.append({"ip": ip, "country_name": self._get_cn(ip), "hostname": hostname, "inaddrarpa": inaddrarpa})
         return enriched_hosts
 
-    def _tcp_dissect(self, conn, data):
+    def _tcp_dissect(self, conn, data, ts):
         """Runs all TCP dissectors.
         @param conn: connection.
         @param data: payload data.
+        @param ts: timestamp.
         """
         if self._check_http(data):
-            self._add_http(conn, data)
+            self._add_http(conn, data, ts)
         # SMTP.
         if conn["dport"] in (25, 587):
             self._reassemble_smtp(conn, data)
@@ -307,14 +304,15 @@ class Pcap:
         if conn["dport"] in self.ssl_ports or conn["sport"] in self.ssl_ports:
             self._https_identify(conn, data)
 
-    def _udp_dissect(self, conn, data):
+    def _udp_dissect(self, conn, data, ts):
         """Runs all UDP dissectors.
         @param conn: connection.
         @param data: payload data.
+        @param ts: timestamp.
         """
         # Select DNS and MDNS traffic.
         if (conn["dport"] in (53, 5353) or conn["sport"] in (53, 5353)) and self._check_dns(data):
-            self._add_dns(data)
+            self._add_dns(data, ts)
 
     def _check_icmp(self, icmp_data):
         """Checks for ICMP traffic.
@@ -359,9 +357,10 @@ class Pcap:
 
         return True
 
-    def _add_dns(self, udpdata):
+    def _add_dns(self, udpdata, ts):
         """Adds a DNS data flow.
         @param udpdata: UDP data flow.
+        @param ts: timestamp.
         """
         dns = dpkt.dns.DNS(udpdata)
 
@@ -465,8 +464,9 @@ class Pcap:
 
                 self.dns_answers.update(new_answers)
                 self.dns_requests[reqtuple]["answers"].extend({"type": i[0], "data": i[1]} for i in new_answers)
-            # else:
-            #    print(query)
+
+                if "first_seen" not in self.dns_requests[reqtuple]:
+                    self.dns_requests[reqtuple]["first_seen"] = ts
         return True
 
     def _add_domain(self, domain):
@@ -501,10 +501,11 @@ class Pcap:
 
         return True
 
-    def _add_http(self, conn, tcpdata):
+    def _add_http(self, conn, tcpdata, ts):
         """Adds an HTTP flow.
         @param conn: TCP connection info.
         @param tcpdata: TCP data flow.
+        @param ts: timestamp.
         """
         if tcpdata in self.http_requests:
             self.http_requests[tcpdata]["count"] += 1
@@ -555,6 +556,7 @@ class Pcap:
             entry["user-agent"] = convert_to_printable(http.headers["user-agent"]) if "user-agent" in http.headers else ""
             entry["version"] = convert_to_printable(http.version)
             entry["method"] = convert_to_printable(http.method)
+            entry["first_seen"] = ts
             self.http_requests[tcpdata] = entry
         except Exception:
             return False
@@ -660,8 +662,11 @@ class Pcap:
             log.error("Python DPKT is not installed, aborting PCAP analysis")
             return self.results
 
-        if not os.path.exists(self.filepath):
-            log.warning('The PCAP file does not exist at path "%s"', self.filepath)
+        if not path_exists(self.filepath):
+            log.debug(
+                'The PCAP file does not exist at path "%s". Did you run analysis with live connection? Did you enable pcap in cuscom/conf/routing.conf?',
+                self.filepath,
+            )
             return self.results
 
         if os.path.getsize(self.filepath) == 0:
@@ -717,7 +722,7 @@ class Pcap:
                     connection["dport"] = tcp.dport
 
                     if tcp.data:
-                        self._tcp_dissect(connection, tcp.data)
+                        self._tcp_dissect(connection, tcp.data, ts)
                         src, sport, dst, dport = connection["src"], connection["sport"], connection["dst"], connection["dport"]
                         if not (
                             (dst, dport, src, sport) in self.tcp_connections_seen
@@ -748,7 +753,7 @@ class Pcap:
                     connection["sport"] = udp.sport
                     connection["dport"] = udp.dport
                     if len(udp.data) > 0:
-                        self._udp_dissect(connection, udp.data)
+                        self._udp_dissect(connection, udp.data, ts)
 
                     src, sport, dst, dport = connection["src"], connection["sport"], connection["dst"], connection["dport"]
                     if not (
@@ -854,10 +859,10 @@ class Pcap2:
     def run(self):
         results = {"http_ex": [], "https_ex": [], "smtp_ex": []}
 
-        if not os.path.exists(self.network_path):
-            os.makedirs(self.network_path, exist_ok=True)
+        if not path_exists(self.network_path):
+            path_mkdir(self.network_path, exist_ok=True)
 
-        if not os.path.exists(self.pcap_path):
+        if not path_exists(self.pcap_path):
             log.warning('The PCAP file does not exist at path "%s"', self.pcap_path)
             return {}
 
@@ -867,7 +872,7 @@ class Pcap2:
         try:
             sorted_r = sorted(r.process(), key=lambda x: x[1])
         except TypeError as e:
-            log.warning("You running old httpreplay %s: pip3 install -U git+https://github.com/CAPESandbox/httpreplay", e)
+            log.warning("You running old httpreplay %s: poetry run pip install -U git+https://github.com/CAPESandbox/httpreplay", e)
             traceback.print_exc()
             return results
         except Exception as e:
@@ -918,10 +923,11 @@ class Pcap2:
                             "mail_body": sent.message,
                         },
                         "resp": {"banner": recv.ready_message},
+                        "first_seen": ts,
                     }
                 )
 
-            if protocol in ("http", "https"):
+            elif protocol in ("http", "https"):
                 response = b""
                 request = b""
                 if isinstance(sent.raw, bytes):
@@ -943,6 +949,7 @@ class Pcap2:
                     # We'll keep these fields here for now.
                     "request": request,  # .decode("latin-1"),
                     "response": response,  # .decode("latin-1"),
+                    "first_seen": ts,
                 }
 
                 if status and status not in (301, 302):
@@ -952,8 +959,7 @@ class Pcap2:
                         req_sha256 = sha256(sent.body).hexdigest()
 
                         req_path = os.path.join(self.network_path, req_sha1)
-                        with open(req_path, "wb") as f:
-                            f.write(sent.body)
+                        _ = path_write_file(req_path, sent.body)
 
                         # It's not perfect yet, but it'll have to do.
                         tmp_dict["req"] = {
@@ -968,8 +974,7 @@ class Pcap2:
                         resp_sha1 = sha1(recv.body).hexdigest()
                         resp_sha256 = sha256(recv.body).hexdigest()
                         resp_path = os.path.join(self.network_path, resp_sha256)
-                        with open(resp_path, "wb") as f:
-                            f.write(recv.body)
+                        _ = path_write_file(resp_path, recv.body)
                         resp_preview = []
                         try:
                             c = 0
@@ -1009,7 +1014,7 @@ class NetworkAnalysis(Processing):
         :return: dictionary of ja3 fingerprint descreptions
         """
         ja3_fprints = {}
-        if os.path.exists(self.ja3_file):
+        if path_exists(self.ja3_file):
             with open(self.ja3_file, "r") as fpfile:
                 for line in fpfile:
                     try:
@@ -1028,7 +1033,7 @@ class NetworkAnalysis(Processing):
             log.error("Python DPKT is not installed, aborting PCAP analysis")
             return {}
 
-        if not os.path.exists(self.pcap_path):
+        if not path_exists(self.pcap_path):
             log.warning('The PCAP file does not exist at path "%s"', self.pcap_path)
             return {}
 
@@ -1045,7 +1050,7 @@ class NetworkAnalysis(Processing):
         if proc_cfg.network.sort_pcap:
             sorted_path = self.pcap_path.replace("dump.", "dump_sorted.")
             sort_pcap(self.pcap_path, sorted_path)
-            if os.path.exists(sorted_path):
+            if path_exists(sorted_path):
                 results["sorted_pcap_sha256"] = File(sorted_path).get_sha256()
                 self.options["sorted"] = True
                 results.update(Pcap(sorted_path, ja3_fprints, self.options).run())
@@ -1064,7 +1069,7 @@ class NetworkAnalysis(Processing):
         """Obtain the client/server random to TLS master secrets mapping that we have obtained through dynamic analysis."""
         tlsmaster = {}
         dump_tls_log = os.path.join(self.analysis_path, "tlsdump", "tlsdump.log")
-        if not os.path.exists(dump_tls_log):
+        if not path_exists(dump_tls_log):
             return tlsmaster
 
         for entry in open(dump_tls_log, "r").readlines() or []:
@@ -1139,11 +1144,9 @@ def batch_sort(input_iterator, output_path, buffer_size=32000, output_class=None
         output_file.close()
     finally:
         for chunk in chunks:
-            try:
+            with suppress(Exception):
                 chunk.close()
-                os.remove(chunk.name)
-            except Exception:
-                pass
+                path_delete(chunk.name)
 
 
 # magic
@@ -1247,13 +1250,13 @@ def next_connection_packets(piter, linktype=1):
     """Extract all packets belonging to the same flow from a pcap packet iterator"""
     first_ft = None
 
-    for ts, raw in piter:
+    for _, raw in piter:
         ft = flowtuple_from_raw(raw, linktype)
         if not first_ft:
             first_ft = ft
 
         sip, dip, sport, dport, proto = ft
-        if not (first_ft == ft or first_ft == (dip, sip, dport, sport, proto)):
+        if first_ft not in (ft, (dip, sip, dport, sport, proto)):
             break
 
         yield {

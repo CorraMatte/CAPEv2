@@ -5,13 +5,13 @@
 import hashlib
 import logging
 import operator
-import os
 from collections import defaultdict
 
 import requests
 
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.objects import File
+from lib.cuckoo.common.path_utils import path_exists
 from lib.cuckoo.common.utils import add_family_detection
 
 try:
@@ -193,7 +193,7 @@ def vt_lookup(category: str, target: str, results: dict = {}, on_demand: bool = 
     if category == "file":
         if not do_file_lookup:
             return {"error": True, "msg": "VT File lookup disabled in processing.conf"}
-        if not os.path.exists(target) and len(target) != 64:
+        if not path_exists(target) and len(target) != 64:
             return {"error": True, "msg": "File doesn't exist"}
 
         sha256 = target if len(target) == 64 else File(target).get_sha256()
@@ -242,7 +242,7 @@ def vt_lookup(category: str, target: str, results: dict = {}, on_demand: bool = 
             "sha1": vt_response.get("data", {}).get("attributes", {}).get("sha1"),
             "sha256": vt_response.get("data", {}).get("attributes", {}).get("sha256"),
             "tlsh": vt_response.get("data", {}).get("attributes", {}).get("tlsh"),
-            "positive": vt_response.get("data", {}).get("attributes", {}).get("last_analysis_stats", {}).get("malicious"),
+            "positives": vt_response.get("data", {}).get("attributes", {}).get("last_analysis_stats", {}).get("malicious"),
             "total": len(engines.keys()),
             "permalink": vt_response.get("data", {}).get("links", {}).get("self"),
         }

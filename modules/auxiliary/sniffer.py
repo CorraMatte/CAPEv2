@@ -11,11 +11,13 @@ from stat import S_ISUID
 from lib.cuckoo.common.abstracts import Auxiliary
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_GUEST_PORT, CUCKOO_ROOT
+from lib.cuckoo.common.path_utils import path_exists
 from lib.cuckoo.core.resultserver import ResultServer
 
 log = logging.getLogger(__name__)
 
 cfg = Config()
+router_cfg = Config("routing")
 
 
 class Sniffer(Auxiliary):
@@ -24,7 +26,7 @@ class Sniffer(Auxiliary):
         self.proc = None
 
     def start(self):
-        if self.task.route in ("none", "None", "drop", "false"):
+        if not router_cfg.routing.enable_pcap and self.task.route in ("none", "None", "drop", "false"):
             return
 
         # Get updated machine info
@@ -47,14 +49,16 @@ class Sniffer(Auxiliary):
         ResultServer()
         resultserver_port = str(self.machine.resultserver_port or cfg.resultserver.port)
 
-        if not os.path.exists(tcpdump):
+        if not path_exists(tcpdump):
             log.error('Tcpdump does not exist at path "%s", network capture aborted', tcpdump)
             return
 
         # https://github.com/cuckoosandbox/cuckoo/pull/2842/files
         mode = os.stat(tcpdump).st_mode
         if mode & S_ISUID:
-            log.error("Tcpdump is not accessible from this user network capture aborted")
+            log.error(
+                "Tcpdump is not accessible from this user network capture aborted. You probably need to add CAPE user to pcap group"
+            )
             return
 
         if not interface:
@@ -63,7 +67,7 @@ class Sniffer(Auxiliary):
 
         pargs = [tcpdump, "-U", "-q", "-s", "0", "-i", interface, "-n"]
 
-        # Trying to save pcap with the same user which cuckoo is running.
+        # Trying to save pcap with the same user which cape is running.
         try:
             user = getpass.getuser()
         except Exception:
@@ -187,7 +191,7 @@ class Sniffer(Auxiliary):
         @return: operation status.
         """
 
-        if self.task.route in ("none", "None", "drop", "false"):
+        if not router_cfg.routing.enable_pcap and self.task.route in ("none", "None", "drop", "false"):
             return
 
         remote = self.options.get("remote", False)

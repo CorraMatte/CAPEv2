@@ -21,6 +21,7 @@ import requests
 from lib.cuckoo.common.config import Config, parse_options
 from lib.cuckoo.common.constants import ANALYSIS_BASE_PATH, CUCKOO_GUEST_PORT, CUCKOO_ROOT
 from lib.cuckoo.common.exceptions import CuckooGuestCriticalTimeout, CuckooGuestError
+from lib.cuckoo.common.path_utils import path_exists, path_mkdir
 from lib.cuckoo.core.database import Database
 
 log = logging.getLogger(__name__)
@@ -40,7 +41,7 @@ def analyzer_zipfile(platform):
     root = os.path.join(CUCKOO_ROOT, "analyzer", platform)
     root_len = len(os.path.abspath(root))
 
-    if not os.path.exists(root):
+    if not path_exists(root):
         log.error("No valid analyzer found at path: %s", root)
         raise CuckooGuestError(f"No valid analyzer found for {platform} platform!")
 
@@ -52,13 +53,6 @@ def analyzer_zipfile(platform):
             path = os.path.join(root, name)
             archive_name = os.path.join(archive_root, name)
             zip_file.write(path, archive_name)
-        # ToDo remove
-        """
-        for name in os.listdir(dirpath):
-            zip_file.write(
-                os.path.join(dirpath, name), os.path.join("bin", name)
-            )
-        """
 
     zip_file.close()
     data = zip_data.getvalue()
@@ -218,24 +212,6 @@ class GuestManager:
         }
         self.post("/store", files={"file": "\n".join(config)}, data=data)
 
-    def upload_support_files(self, options):
-        """Upload supporting files from zip temp directory if they exist
-        :param options: options
-        :return:
-        """
-        log.info("Task #%s: Uploading support files to guest (id=%s, ip=%s)", self.task_id, self.vmid, self.ipaddr)
-        basedir = os.path.dirname(options["target"])
-
-        for dirpath, _, files in os.walk(basedir):
-            for xf in files:
-                target = os.path.join(dirpath, xf)
-                # Copy all files except for the original target
-                if not target == options["target"]:
-                    data = {"filepath": os.path.join(self.determine_temp_path(), xf)}
-                    files = {"file": (xf, open(target, "rb"))}
-                    self.post("/store", files=files, data=data)
-        return
-
     def upload_scripts(self):
         """Upload various scripts such as pre_script and during_scripts."""
         log.info("Task #%s: Uploading script files to guest (id=%s, ip=%s)", self.task_id, self.vmid, self.ipaddr)
@@ -244,7 +220,7 @@ class GuestManager:
         # File path of Analyses path. Storage of script
         analyses_path = os.path.join(ANALYSIS_BASE_PATH, "analyses", str(self.task_id), "scripts")
         # Create folder in Analyses
-        os.makedirs(analyses_path, exist_ok=True)
+        path_mkdir(analyses_path, exist_ok=True)
 
         for name in glob.glob(os.path.join(base_dir, "*_script.*")):
             # Copy file to Analyses/{task_ID}/scripts
@@ -253,7 +229,6 @@ class GuestManager:
             data = {"filepath": os.path.join(self.determine_temp_path(), basename).replace("/", "\\")}
             files = {"file": (basename, open(name, "rb"))}
             self.post("/store", files=files, data=data)
-        return
 
     def start_analysis(self, options):
         """Start the analysis by uploading all required files.
@@ -321,18 +296,24 @@ class GuestManager:
         # ToDo fix it
         # self.aux.callback("prepare_guest")
 
+        # ToDo https://github.com/kevoreilly/CAPEv2/issues/1468
+        # Lookup file if current doesn't exist in TMP anymore
+        alternative_path = False
+        if not path_exists(options["target"]):
+            path_found = db.sample_path_by_hash(task_id=options["id"])
+            if path_found:
+                alternative_path = path_found[0]
+
+        sample_path = alternative_path or options["target"]
         # If the target is a file, upload it to the guest.
-        if options["category"] == "file" or options["category"] == "archive":
+        if options["category"] in ("file", "archive"):
             data = {
                 "filepath": os.path.join(self.determine_temp_path(), options["file_name"]),
             }
             files = {
-                "file": ("sample.bin", open(options["target"], "rb")),
+                "file": ("sample.bin", open(sample_path, "rb")),
             }
             self.post("/store", files=files, data=data)
-
-        # check for support files and upload them to guest.
-        self.upload_support_files(options)
 
         # upload additional scripts
         self.upload_scripts()

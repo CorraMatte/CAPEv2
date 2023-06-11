@@ -1,7 +1,7 @@
 import ctypes
 import logging
 import sys
-from winreg import HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, REG_EXPAND_SZ, REG_MULTI_SZ, REG_SZ, CloseKey, CreateKeyEx, SetValueEx
+from winreg import HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, REG_EXPAND_SZ, REG_MULTI_SZ, CloseKey, CreateKeyEx, SetValueEx
 
 from lib.api.process import Process
 from lib.common.abstracts import Package
@@ -129,9 +129,9 @@ class ServiceDll(Package):
                 return
             log.info("Created service %s (handle: 0x%s)", servicename.decode(), service_handle)
             self.set_keys(servicename.decode(), dllpath)
-            servproc = Process(options=self.options, config=self.config, pid=self.config.services_pid, suspended=False)
+            servproc = Process(options=self.options, config=self.config, pid=self.config.services_pid)
             filepath = servproc.get_filepath()
-            servproc.inject(injectmode=INJECT_QUEUEUSERAPC, interest=filepath, nosleepskip=True)
+            servproc.inject(interest=filepath, nosleepskip=True)
             servproc.close()
             KERNEL32.Sleep(500)
             service_launched = ADVAPI32.StartServiceA(service_handle, 0, None)

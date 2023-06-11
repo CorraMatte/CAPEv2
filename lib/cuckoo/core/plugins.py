@@ -10,6 +10,7 @@ import pkgutil
 import sys
 import timeit
 from collections import defaultdict
+from contextlib import suppress
 from distutils.version import StrictVersion
 
 from lib.cuckoo.common.abstracts import Auxiliary, Feed, LibVirtMachinery, Machinery, Processing, Report, Signature
@@ -22,6 +23,7 @@ from lib.cuckoo.common.exceptions import (
     CuckooProcessingError,
     CuckooReportError,
 )
+from lib.cuckoo.common.path_utils import path_exists
 from lib.cuckoo.common.utils import add_family_detection
 from lib.cuckoo.core.database import Database
 
@@ -99,8 +101,7 @@ def register_plugin(group, name):
 def list_plugins(group=None):
     if group:
         return _modules[group]
-    else:
-        return _modules
+    return _modules
 
 
 class RunAuxiliary:
@@ -196,7 +197,7 @@ class RunProcessing:
         """@param task: task dictionary of the analysis to process."""
         self.task = task
         self.analysis_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task["id"]))
-        self.cfg = Config("processing")
+        self.cfg = processing_cfg
         self.cuckoo_cfg = Config()
         self.results = results
 
@@ -274,8 +275,7 @@ class RunProcessing:
             # Run every loaded processing module.
             for module in processing_list:
                 result = self.process(module)
-                # If it provided some results, append it to the big results
-                # container.
+                # If it provided some results, append it to the big results container.
                 if result:
                     self.results.update(result)
         else:
@@ -292,7 +292,7 @@ class RunProcessing:
 
         # For correct error log on webgui
         logs = os.path.join(self.analysis_path, "logs")
-        if os.path.exists(logs):
+        if path_exists(logs):
             for file_name in os.listdir(logs):
                 file_path = os.path.join(logs, file_name)
 
@@ -318,7 +318,7 @@ class RunSignatures:
         self.task = task
         self.results = results
         self.ttps = []
-        self.cfg_processing = Config("processing")
+        self.cfg_processing = processing_cfg
         self.analysis_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task["id"]))
 
         # Gather all enabled & up-to-date Signatures.
@@ -387,13 +387,10 @@ class RunSignatures:
         """
         filename = os.path.join(CUCKOO_ROOT, "data", "signature_overlay.json")
 
-        try:
+        with suppress(IOError):
             with open(filename) as fh:
                 odata = json.load(fh)
                 return odata
-        except IOError:
-            pass
-
         return {}
 
     def _apply_overlay(self, signature, overlay):
@@ -493,6 +490,9 @@ class RunSignatures:
         test_signature: signature name, Ex: cape_detected_threat, to test unique signature
         """
 
+        if not self.cfg_processing.detections.behavior:
+            return
+
         # This will contain all the matched signatures.
         matched = []
         stats = {}
@@ -500,6 +500,10 @@ class RunSignatures:
         if test_signature:
             self.evented_list = next((sig for sig in self.evented_list if sig.name == test_signature), [])
             self.non_evented_list = next((sig for sig in self.non_evented_list if sig.name == test_signature), [])
+            if not isinstance(self.evented_list, list):
+                self.evented_list = [self.evented_list]
+            if not isinstance(self.non_evented_list, list):
+                self.non_evented_list = [self.non_evented_list]
 
         if self.evented_list and "behavior" in self.results:
             log.debug("Running %d evented signatures", len(self.evented_list))
@@ -538,6 +542,8 @@ class RunSignatures:
                             pretime = timeit.default_timer()
                             result = sig.on_call(call, proc)
                             timediff = timeit.default_timer() - pretime
+                            if sig.name not in stats:
+                                stats[sig.name] = 0
                             stats[sig.name] += timediff
                         except NotImplementedError:
                             result = False
@@ -566,7 +572,11 @@ class RunSignatures:
                     if result and not sig.matched:
                         matched.append(sig.as_result())
                         if hasattr(sig, "ttps"):
-                            [self.ttps.append({"ttp": ttp, "signature": sig.name}) for ttp in sig.ttps]
+                            [
+                                self.ttps.append({"ttp": ttp, "signature": sig.name})
+                                for ttp in sig.ttps
+                                if {"ttp": ttp, "signature": sig.name} not in self.ttps
+                            ]
 
         # Link this into the results already at this point, so non-evented signatures can use it
         self.results["signatures"] = matched
@@ -593,7 +603,11 @@ class RunSignatures:
                     # If the signature is matched, add it to the list.
                     if match and not signature.matched:
                         if hasattr(signature, "ttps"):
-                            [self.ttps.append({"ttp": ttp, "signature": signature.name}) for ttp in signature.ttps]
+                            [
+                                self.ttps.append({"ttp": ttp, "signature": signature.name})
+                                for ttp in signature.ttps
+                                if {"ttp": ttp, "signature": signature.name} not in self.ttps
+                            ]
                         signature.matched = True
 
         for signature in self.signatures:
@@ -656,7 +670,7 @@ class RunReporting:
 
         self.results = results
         self.analysis_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task["id"]))
-        self.cfg = Config("reporting")
+        self.cfg = reporting_cfg
         self.reprocess = reprocess
 
     def process(self, module):
@@ -698,14 +712,7 @@ class RunReporting:
         try:
             log.debug('Executing reporting module "%s"', current.__class__.__name__)
             pretime = timeit.default_timer()
-
-            if module_name == "submitCAPE" and self.reprocess:
-                tasks = db.list_parents(self.task["id"])
-                if tasks:
-                    self.results["CAPE_children"] = tasks
-                return
-            else:
-                current.run(self.results)
+            current.run(self.results)
             timediff = timeit.default_timer() - pretime
             self.results["statistics"]["reporting"].append(
                 {

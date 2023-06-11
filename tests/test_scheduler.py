@@ -1,9 +1,7 @@
 import os
-import pathlib
 import queue
 import shutil
 from datetime import datetime
-from unittest.mock import Mock
 
 import pytest
 import pytest_asyncio
@@ -12,6 +10,7 @@ from tcr_misc import get_sample, random_string
 
 import lib.cuckoo.core.scheduler as scheduler
 from lib.cuckoo.common.exceptions import CuckooOperationalError
+from lib.cuckoo.common.path_utils import path_cwd, path_delete, path_exists, path_mkdir, path_object, path_write_file
 from lib.cuckoo.core.scheduler import AnalysisManager
 
 
@@ -27,7 +26,7 @@ class mock_task:
 @pytest_asyncio.fixture
 def grab_sample():
     def _grab_sample(sample_hash):
-        sample_location = pathlib.Path(__file__).absolute().parent.as_posix() + "/test_objects/" + sample_hash
+        sample_location = path_object(__file__).absolute().parent.as_posix() + "/test_objects/" + sample_hash
         get_sample(hash=sample_hash, download_location=sample_location)
         return sample_location
 
@@ -61,25 +60,24 @@ def setup_machinery():
 @pytest_asyncio.fixture
 def symlink():
     try:
-        os.makedirs("fstorage/binaries", exist_ok=True)
+        path_mkdir("fstorage/binaries", exist_ok=True)
     except Exception as e:
         print(("Error setting up, probably fine:" + str(e)))
-    tempsym = os.getcwd() + "/storage/binaries/e3be3b"
+    tempsym = path_cwd() / "storage/binaries/e3be3b"
     real = "/tmp/" + random_string()
-    with open(real, mode="w") as f:
-        f.write("\x00")
+    _ = path_write_file(real, "\x00", mode="text")
 
     try:
-        os.makedirs(os.getcwd() + "/storage/binaries/", exist_ok=True)
+        path_mkdir(path_cwd() / "storage/binaries/", exist_ok=True)
     except Exception as e:
         print(("Error setting up, probably fine:" + str(e)))
-    print(os.path.exists(real), os.path.exists(tempsym))
+    print(path_exists(real), path_exists(tempsym))
     os.symlink(real, tempsym)
     yield
     try:
-        os.unlink(tempsym)
-        os.unlink(real)
-        os.unlink("binary")
+        path_delete(tempsym)
+        path_delete(real)
+        path_delete("binary")
     except Exception as e:
         print(("Error cleaning up, probably fine:" + str(e)))
 
@@ -88,7 +86,7 @@ def symlink():
 def clean_init_storage():
     yield
     try:
-        shutil.rmtree(os.getcwd() + "/storage/analyses/1234")
+        shutil.rmtree(path_cwd() / "storage/analyses/1234")
     except Exception as e:
         print(("Error cleaning up, probably fine:" + str(e)))
 
@@ -96,12 +94,12 @@ def clean_init_storage():
 @pytest_asyncio.fixture
 def create_store_file_dir():
     try:
-        os.makedirs(os.getcwd() + "/storage/binaries/")
+        path_mkdir(path_cwd() / "storage/binaries/")
     except Exception as e:
         print(("Error setting up, probably fine:" + str(e)))
     yield
     try:
-        shutil.rmtree(os.getcwd() + "/storage/binaries")
+        shutil.rmtree(path_cwd() / "storage/binaries")
     except Exception as e:
         print(("Error cleaning up, probably fine:" + str(e)))
 
@@ -126,8 +124,12 @@ class TestAnalysisManager:
             "max_vmstartup_count": 5,
             "daydelta": 0,
             "max_analysis_count": 0,
+            "max_len": 196,
+            "sanitize_len": 32,
+            "sanitize_to_len": 24,
             "freespace_processing": 15000,
             "periodic_log": False,
+            "fail_unserviceable": True,
         }
 
         assert analysis_man.task.id == 1234
@@ -139,7 +141,7 @@ class TestAnalysisManager:
 
     def test_init_storage_already_exists(self, clean_init_storage, caplog):
         analysis_man = AnalysisManager(task=mock_task(), error_queue=queue.Queue())
-        os.makedirs(os.getcwd() + "/storage/analyses/1234")
+        path_mkdir(path_cwd() / "storage/analyses/1234")
 
         analysis_man.init_storage()
         assert "already exists at path" in caplog.text
@@ -196,18 +198,17 @@ class TestAnalysisManager:
 
     @pytest.mark.skip(reason="TODO")
     def test_store_file_symlink_err(self, symlink, caplog):
-        with open("binary", "wb") as f:
-            f.write(b"\x00")
+        _ = path_write_file("binary", b"\x00")
         analysis_man = AnalysisManager(task=mock_task(), error_queue=queue.Queue())
         analysis_man.store_file(sha256="e3be3b")
         assert "Unable to create symlink/copy" in caplog.text
 
     def test_acquire_machine(self, setup_machinery, setup_machine_lock):
         class mock_machinery:
-            def availables(self, machine_id, platform, tags, arch):
+            def availables(self, label, platform, tags, arch, os_version):
                 return True
 
-            def acquire(self, machine_id, platform, tags, arch):
+            def acquire(self, machine_id, platform, tags, arch, os_version):
                 class mock_acquire:
                     name = "mock_mach"
                     label = "mock_label"
@@ -221,6 +222,9 @@ class TestAnalysisManager:
 
         class mock_plat:
             platform = "plat"
+
+        class mock_package:
+            package = "foo"
 
         class mock_tags:
             class mock_tag:
@@ -242,6 +246,7 @@ class TestAnalysisManager:
         mock_task_machine.platform = mock_plat()
         mock_task_machine.tags = mock_tags()
         mock_task_machine.arch = mock_arch()
+        mock_task_machine.package = mock_package()
 
         analysis_man = AnalysisManager(task=mock_task_machine, error_queue=queue.Queue())
         analysis_man.acquire_machine()
@@ -342,6 +347,7 @@ class TestAnalysisManager:
             "terminate_processes": False,
             "ip": "1.2.3.4",
             "clock": datetime(2099, 1, 1, 9, 1, 1),
+            "enable_trim": 0,
             "port": "1337",
             "file_type": "Python script, ASCII text executable",
             "options": "foo=bar",
@@ -354,11 +360,12 @@ class TestAnalysisManager:
             "procmon": False,
             "digisig": True,
             "disguise": True,
-            "sysmon": False,
-            "filepickup": False,
+            "sysmon_windows": False,
+            "sysmon_linux": False,
+            "file_pickup": False,
             "filecollector": True,
             "permissions": False,
-            "screenshots_linux": False,
+            "screenshots_linux": True,
             "screenshots_windows": True,
             "tlsdump": True,
             "usage": False,
@@ -370,6 +377,7 @@ class TestAnalysisManager:
             "upload_max_size": 100000000,
             "during_script": False,
             "pre_script": False,
+            "windows_static_route": False,
         }
 
     @pytest.mark.skip(reason="This error is from parse_pe get_exports, which is not part of scheduler anymore")
@@ -420,6 +428,7 @@ class TestAnalysisManager:
             "terminate_processes": False,
             "ip": "1.2.3.4",
             "clock": datetime(2099, 1, 1, 9, 1, 1),
+            "enable_trim": 0,
             "port": "1337",
             "file_type": "PE32 executable (console) Intel 80386, for MS Windows",
             "options": "foo=bar",
@@ -432,7 +441,8 @@ class TestAnalysisManager:
             "procmon": False,
             "digisig": True,
             "disguise": True,
-            "sysmon": False,
+            "sysmon_windows": False,
+            "sysmon_linux": False,
             "filepickup": False,
             "permissions": False,
             "screenshots": True,

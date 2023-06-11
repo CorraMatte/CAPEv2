@@ -9,6 +9,7 @@ import random
 import sys
 import tempfile
 from base64 import urlsafe_b64encode
+from contextlib import suppress
 
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
@@ -18,12 +19,10 @@ sys.path.append(settings.CUCKOO_PATH)
 from uuid import NAMESPACE_DNS, uuid3
 
 from lib.cuckoo.common.config import Config
-from lib.cuckoo.common.objects import File
-from lib.cuckoo.common.quarantine import unquarantine
+from lib.cuckoo.common.path_utils import path_delete, path_exists, path_mkdir
 from lib.cuckoo.common.saztopcap import saz_to_pcap
-from lib.cuckoo.common.utils import generate_fake_name, get_options, get_user_filename, sanitize_filename, store_temp_file
+from lib.cuckoo.common.utils import get_options, get_user_filename, sanitize_filename, store_temp_file
 from lib.cuckoo.common.web_utils import (
-    _download_file,
     all_nodes_exits_list,
     all_vms_tags,
     download_file,
@@ -41,6 +40,7 @@ from lib.cuckoo.core.rooter import _load_socks5_operational, vpns
 cfg = Config("cuckoo")
 routing = Config("routing")
 repconf = Config("reporting")
+distconf = Config("distributed")
 processing = Config("processing")
 aux_conf = Config("auxiliary")
 web_conf = Config("web")
@@ -69,9 +69,7 @@ def get_form_data(platform):
     # Prepare a list of VM names, description label based on tags.
     machines = []
     for machine in db.list_machines():
-        tags = []
-        for tag in machine.tags:
-            tags.append(tag.name)
+        tags = [tag.name for tag in machine.tags]
 
         label = f"{machine.label}:{machine.arch}"
         if tags:
@@ -114,12 +112,11 @@ def force_int(value):
 def get_platform(magic):
     if magic and any(x in magic for x in VALID_LINUX_TYPES):
         return "linux"
-    else:
-        return "windows"
+    return "windows"
 
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
-def index(request, resubmit_hash=False):
+def index(request, task_id=None, resubmit_hash=None):
     remote_console = False
     if request.method == "POST":
 
@@ -190,8 +187,11 @@ def index(request, resubmit_hash=False):
         if request.POST.get("import_reconstruction"):
             options += "import_reconstruction=1,"
 
-        if request.POST.get("disable_cape"):
-            options += "disable_cape=1,"
+        if request.POST.get("unpacker"):
+            options += "unpacker=2,"
+
+        if request.POST.get("syscall"):
+            options += "syscall=1,"
 
         if request.POST.get("kernel_analysis"):
             options += "kernel_analysis=yes,"
@@ -237,6 +237,7 @@ def index(request, resubmit_hash=False):
             "options": options,
             "only_extraction": False,
             "user_id": request.user.id or 0,
+            "package": package,
         }
         task_category = False
         samples = []
@@ -246,9 +247,6 @@ def index(request, resubmit_hash=False):
         elif "sample" in request.FILES:
             task_category = "sample"
             samples = request.FILES.getlist("sample")
-        elif "quarantine" in request.FILES:
-            task_category = "quarantine"
-            samples = request.FILES.getlist("quarantine")
         elif "static" in request.FILES:
             task_category = "static"
             samples = request.FILES.getlist("static")
@@ -270,7 +268,7 @@ def index(request, resubmit_hash=False):
             task_category = "vtdl"
             samples = request.POST.get("vtdl").strip()
 
-        list_of_files = []
+        list_of_tasks = []
         if task_category in ("url", "dlnexec"):
             if not samples:
                 return render(request, "error.html", {"error": "You specified an invalid URL!"})
@@ -280,12 +278,12 @@ def index(request, resubmit_hash=False):
                 if task_category == "dlnexec":
                     path, content, sha256 = process_new_dlnexec_task(url, route, options, custom)
                     if path:
-                        list_of_files.append((content, path, sha256))
+                        list_of_tasks.append((content, path, sha256))
                 elif task_category == "url":
-                    list_of_files.append(("", url, ""))
+                    list_of_tasks.append(("", url, ""))
 
-        elif task_category in ("sample", "quarantine", "static", "pcap"):
-            list_of_files, details = process_new_task_files(request, samples, details, opt_filename, unique)
+        elif task_category in ("sample", "static", "pcap"):
+            list_of_tasks, details = process_new_task_files(request, samples, details, opt_filename, unique)
 
         elif task_category == "resubmit":
             for hash in samples:
@@ -293,18 +291,18 @@ def index(request, resubmit_hash=False):
                 if len(hash) in (32, 40, 64):
                     paths = db.sample_path_by_hash(hash)
                 else:
-                    task_binary = os.path.join(settings.CUCKOO_PATH, "storage", "analyses", str(hash), "binary")
-                    if os.path.exists(task_binary):
+                    task_binary = os.path.join(settings.CUCKOO_PATH, "storage", "analyses", str(task_id), "binary")
+                    if path_exists(task_binary):
                         paths.append(task_binary)
                     else:
-                        tmp_paths = db.find_sample(task_id=int(hash))
+                        tmp_paths = db.find_sample(task_id=task_id)
                         if not tmp_paths:
                             details["errors"].append({hash: "Task not found for resubmission"})
                             continue
                         for tmp_sample in tmp_paths:
                             path = False
                             tmp_dict = tmp_sample.to_dict()
-                            if os.path.exists(tmp_dict.get("target", "")):
+                            if path_exists(tmp_dict.get("target", "")):
                                 path = tmp_dict["target"]
                             else:
                                 tmp_tasks = db.find_sample(sample_id=tmp_dict["sample_id"])
@@ -312,11 +310,18 @@ def index(request, resubmit_hash=False):
                                     tmp_path = os.path.join(
                                         settings.CUCKOO_PATH, "storage", "binaries", tmp_task.to_dict()["sha256"]
                                     )
-                                    if os.path.exists(tmp_path):
+                                    if path_exists(tmp_path):
                                         path = tmp_path
                                         break
                             if path:
                                 paths.append(path)
+
+                if not paths:
+                    # Self Extracted support folder
+                    path = os.path.join(settings.CUCKOO_PATH, "storage", "analyses", str(task_id), "selfextracted", hash)
+                    if path_exists(path):
+                        paths.append(path)
+
                 if not paths:
                     details["errors"].append({hash: "File not found on hdd for resubmission"})
                     continue
@@ -326,22 +331,32 @@ def index(request, resubmit_hash=False):
                     details["errors"].append({hash: f"Can't find {hash} on disk"})
                     continue
                 folder = os.path.join(settings.TEMP_PATH, "cape-resubmit")
-                if not os.path.exists(folder):
-                    os.makedirs(folder)
+                if not path_exists(folder):
+                    path_mkdir(folder)
                 base_dir = tempfile.mkdtemp(prefix="resubmit_", dir=folder)
                 if opt_filename:
                     filename = base_dir + "/" + opt_filename
                 else:
                     filename = base_dir + "/" + sanitize_filename(hash)
                 path = store_temp_file(content, filename)
-                list_of_files.append((content, path, hash))
+                list_of_tasks.append((content, path, hash))
 
         # Hack for resubmit first find all files and then put task as proper category
-        if job_category and job_category in ("resubmit", "sample", "quarantine", "static", "pcap", "dlnexec", "vtdl"):
+        if job_category and job_category in ("resubmit", "sample", "static", "pcap", "dlnexec", "vtdl"):
             task_category = job_category
 
         if task_category == "resubmit":
-            for content, path, sha256 in list_of_files:
+            for content, path, sha256 in list_of_tasks:
+                if web_conf.pre_script.enabled and "pre_script" in request.FILES:
+                    pre_script = request.FILES["pre_script"]
+                    details["pre_script_name"] = request.FILES["pre_script"].name
+                    details["pre_script_content"] = pre_script.read()
+
+                if web_conf.during_script.enabled and "during_script" in request.FILES:
+                    during_script = request.FILES["during_script"]
+                    details["during_script_name"] = request.FILES["during_script"].name
+                    details["during_script_content"] = during_script.read()
+
                 details["path"] = path
                 details["content"] = content
                 status, task_ids_tmp = download_file(**details)
@@ -349,14 +364,15 @@ def index(request, resubmit_hash=False):
                     details["errors"].append({os.path.basename(filename): task_ids_tmp})
                 else:
                     details["task_ids"] = task_ids_tmp
-                    if web_conf.general.get("existent_tasks", False):
+                    if web_conf.web_reporting.get("enabled", False) and web_conf.general.get("existent_tasks", False):
                         records = perform_search("target_sha256", hash, search_limit=5)
-                        for record in records or []:
-                            existent_tasks.setdefault(record["target"]["file"]["sha256"], []).append(record)
+                        if records:
+                            for record in records or []:
+                                existent_tasks.setdefault(record["target"]["file"]["sha256"], []).append(record)
 
         elif task_category == "sample":
             details["service"] = "WebGUI"
-            for content, path, sha256 in list_of_files:
+            for content, path, sha256 in list_of_tasks:
                 if web_conf.pre_script.enabled and "pre_script" in request.FILES:
                     pre_script = request.FILES["pre_script"]
                     details["pre_script_name"] = request.FILES["pre_script"].name
@@ -378,47 +394,26 @@ def index(request, resubmit_hash=False):
                 else:
                     if web_conf.general.get("existent_tasks", False):
                         records = perform_search("target_sha256", sha256, search_limit=5)
-                        for record in records:
-                            if record.get("target").get("file", {}).get("sha256"):
-                                existent_tasks.setdefault(record["target"]["file"]["sha256"], []).append(record)
-                    details["task_ids"] = task_ids_tmp
-
-        elif task_category == "quarantine":
-            for content, tmp_path, sha256 in list_of_files:
-                path = unquarantine(tmp_path)
-                try:
-                    os.remove(tmp_path)
-                except Exception as e:
-                    print(e)
-
-                if not path:
-                    details["errors"].append({os.path.basename(path): "You uploaded an unsupported quarantine file."})
-                    continue
-
-                details["path"] = path
-                details["content"] = content
-                status, task_ids_tmp = download_file(**details)
-                if status == "error":
-                    details["errors"].append({os.path.basename(path): task_ids_tmp})
-                else:
+                        if records:
+                            for record in records:
+                                if record.get("target").get("file", {}).get("sha256"):
+                                    existent_tasks.setdefault(record["target"]["file"]["sha256"], []).append(record)
                     details["task_ids"] = task_ids_tmp
 
         elif task_category == "static":
-            for content, path, sha256 in list_of_files:
-                task_id = db.add_static(file_path=path, priority=priority, tlp=tlp, user_id=request.user.id or 0)
+            for content, path, sha256 in list_of_tasks:
+                task_id = db.add_static(file_path=path, priority=priority, tlp=tlp, options=options, user_id=request.user.id or 0)
                 if not task_id:
                     return render(request, "error.html", {"error": "We don't have static extractor for this"})
                 details["task_ids"] += task_id
 
         elif task_category == "pcap":
-            for content, path, sha256 in list_of_files:
+            for content, path, sha256 in list_of_tasks:
                 if path.lower().endswith(b".saz"):
                     saz = saz_to_pcap(path)
                     if saz:
-                        try:
-                            os.remove(path)
-                        except Exception as e:
-                            pass
+                        with suppress(Exception):
+                            path_delete(path)
                         path = saz
                     else:
                         details["errors"].append({os.path.basename(path): "Conversion from SAZ to PCAP failed."})
@@ -429,7 +424,7 @@ def index(request, resubmit_hash=False):
                     details["task_ids"].append(task_id)
 
         elif task_category == "url":
-            for _, url, _ in list_of_files:
+            for _, url, _ in list_of_tasks:
                 if machine.lower() == "all":
                     machines = [vm.name for vm in db.list_machines(platform=platform)]
                 elif machine:
@@ -470,7 +465,7 @@ def index(request, resubmit_hash=False):
                     details["task_ids"].append(task_id)
 
         elif task_category == "dlnexec":
-            for content, path, sha256 in list_of_files:
+            for content, path, sha256 in list_of_tasks:
                 details["path"] = path
                 details["content"] = content
                 details["service"] = "DLnExec"
@@ -519,7 +514,7 @@ def index(request, resubmit_hash=False):
         enabledconf["dlnexec"] = settings.DLNEXEC
         enabledconf["url_analysis"] = settings.URL_ANALYSIS
         enabledconf["tags"] = False
-        enabledconf["dist_master_storage_only"] = repconf.distributed.master_storage_only
+        enabledconf["dist_master_storage_only"] = distconf.distributed.master_storage_only
         enabledconf["linux_on_gui"] = web_conf.linux.enabled
         enabledconf["tlp"] = web_conf.tlp.enabled
         enabledconf["timeout"] = cfg.timeouts.default
@@ -555,13 +550,10 @@ def index(request, resubmit_hash=False):
         vpn_random = ""
 
         if routing.socks5.random_socks5 and socks5s:
-            socks5s_random = random.choice(socks5s.values()).get("name", False)
+            socks5s_random = socks5s[random.choice(list(socks5s.keys()))]
 
-        if routing.vpn.random_vpn:
-            vpn_random = random.choice(list(vpns.values())).get("name", False)
-
-        if socks5s:
-            socks5s_random = random.choice(list(socks5s.values())).get("name", False)
+        if routing.vpn.random_vpn and vpns:
+            vpn_random = vpns[random.choice(list(vpns.keys()))]
 
         random_route = False
         if vpn_random and socks5s_random:
@@ -571,13 +563,37 @@ def index(request, resubmit_hash=False):
         elif socks5s_random:
             random_route = socks5s_random
 
+        # prepare data for the gui rendering
+        if random_route:
+            if random_route is vpn_random:
+                random_route = {
+                    "name": random_route["name"],
+                    "description": random_route["description"],
+                    "interface": random_route["interface"],
+                    "type": "VPN",
+                }
+            else:
+                random_route = {
+                    "name": random_route["description"],
+                    "host": random_route["host"],
+                    "port": random_route["port"],
+                    "type": "SOCKS5",
+                }
+        socks5s_data = [
+            {"name": v["description"], "host": v["host"], "port": v["port"], "type": "socks5"} for k, v in socks5s.items()
+        ]
+        vpns_data = [
+            {"name": v["name"], "description": v["description"], "interface": v["interface"], "type": "vpn"} for v in vpns.values()
+        ]
+
         existent_tasks = {}
         if resubmit_hash:
             if web_conf.general.get("existent_tasks", False):
                 records = perform_search("target_sha256", resubmit_hash, search_limit=5)
-                for record in records:
-                    existent_tasks.setdefault(record["target"]["file"]["sha256"], list())
-                    existent_tasks[record["target"]["file"]["sha256"]].append(record)
+                if records:
+                    for record in records:
+                        existent_tasks.setdefault(record["target"]["file"]["sha256"], [])
+                        existent_tasks[record["target"]["file"]["sha256"]].append(record)
 
         return render(
             request,
@@ -585,9 +601,9 @@ def index(request, resubmit_hash=False):
             {
                 "packages": sorted(packages),
                 "machines": machines,
-                "vpns": list(vpns.values()),
+                "vpns": vpns_data,
                 "random_route": random_route,
-                "socks5s": list(socks5s.values()),
+                "socks5s": socks5s_data,
                 "route": routing.routing.route,
                 "internet": routing.routing.internet,
                 "inetsim": routing.inetsim.enabled,
@@ -625,16 +641,14 @@ def remote_session(request, task_id):
         return render(request, "error.html", {"error": "The specified task doesn't seem to exist."})
 
     machine_status = False
-    label = ""
     session_data = ""
 
     if task.status == "running":
-        machine = db.view_machine(task.machine)
-        label = machine.label
+        machine = db.view_machine_by_label(task.machine)
         guest_ip = machine.ip
         machine_status = True
         session_id = uuid3(NAMESPACE_DNS, task_id).hex[:16]
-        session_data = urlsafe_b64encode(f"{session_id}|{label}|{guest_ip}".encode("utf8")).decode("utf8")
+        session_data = urlsafe_b64encode(f"{session_id}|{task.machine}|{guest_ip}".encode("utf8")).decode("utf8")
 
     return render(
         request,

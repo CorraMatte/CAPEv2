@@ -89,6 +89,12 @@ class LnkShortcut:
             if HAVE_LNK3:
                 try:
                     data = LnkParse3.lnk_file(f).get_json(get_all=True)
+                    if "creation_time" in data.get("header", {}) and data["header"].get("creation_time"):
+                        data["header"]["creation_time"] = data["header"]["creation_time"].strftime("%Y-%m-%d %H:%S:%M")
+                    if "accessed_time" in data.get("header", {}) and data["header"].get("accessed_time"):
+                        data["header"]["accessed_time"] = data["header"]["accessed_time"].strftime("%Y-%m-%d %H:%S:%M")
+                    if "modified_time" in data.get("header", {}) and data["header"].get("modified_time"):
+                        data["header"]["modified_time"] = data["header"]["modified_time"].strftime("%Y-%m-%d %H:%S:%M")
                 except (LnkParserError, struct.error) as e:
                     log.error("Parse LNK error: %s", str(e))
                     return {}
@@ -103,7 +109,7 @@ class LnkShortcut:
                     return
 
                 header = LnkHeader.from_buffer_copy(self.buf[: ctypes.sizeof(LnkHeader)])
-                if header.signature[:] != self.signature or header.guid[:] != self.guid:
+                if header.signature.copy() != self.signature or header.guid.copy() != self.guid:
                     return
 
                 ret = {"flags": {}, "attrs": []}

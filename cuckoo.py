@@ -7,9 +7,10 @@ import argparse
 import logging
 import os
 import sys
+from pathlib import Path
 
-if sys.version_info[:2] < (3, 6):
-    sys.exit("You are running an incompatible version of Python, please use >= 3.6")
+if sys.version_info[:2] < (3, 8):
+    sys.exit("You are running an incompatible version of Python, please use >= 3.8")
 
 if os.geteuid() == 0 and os.getenv("CAPE_AS_ROOT", "0") != "1":
     sys.exit("Root is not allowed. You gonna break permission and other parts of CAPE. RTM!")
@@ -26,6 +27,7 @@ try:
     from lib.cuckoo.core.startup import (
         check_configs,
         check_linux_dist,
+        check_tcpdump_permissions,
         check_webgui_mongo,
         check_working_directory,
         create_structure,
@@ -48,7 +50,7 @@ check_linux_dist()
 
 
 def cuckoo_init(quiet=False, debug=False, artwork=False, test=False):
-    cur_path = os.getcwd()
+    cur_path = Path.cwd()
     os.chdir(CUCKOO_ROOT)
 
     logo()
@@ -81,6 +83,7 @@ def cuckoo_init(quiet=False, debug=False, artwork=False, test=False):
     init_yara()
     init_rooter()
     init_routing()
+    check_tcpdump_permissions()
 
     # This is just a temporary hack, we need an actual test suite to integrate
     # with Travis-CI.
@@ -92,7 +95,7 @@ def cuckoo_init(quiet=False, debug=False, artwork=False, test=False):
 
 
 def cuckoo_main(max_analysis_count=0):
-    cur_path = os.getcwd()
+    cur_path = Path.cwd()
     os.chdir(CUCKOO_ROOT)
 
     try:
