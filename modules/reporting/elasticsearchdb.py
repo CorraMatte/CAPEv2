@@ -95,9 +95,10 @@ class ElasticSearchDB(Report):
             else info["machine"]["shutdown_on"]
         )
 
-        for dropped in report["dropped"]:
-            if "pe" in dropped:
-                dropped["pe"]["timestamp"] = datetime.strptime(dropped["pe"]["timestamp"], "%Y-%m-%d %H:%M:%S")
+        if "dropped" in report:
+            for dropped in report["dropped"]:
+                if "pe" in dropped:
+                    dropped["pe"]["timestamp"] = datetime.strptime(dropped["pe"]["timestamp"], "%Y-%m-%d %H:%M:%S")
 
     # Fix signatures from string to list in order to have a common mapping
     def fix_signature_results(self, report):
