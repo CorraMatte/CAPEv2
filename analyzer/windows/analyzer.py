@@ -285,10 +285,10 @@ class Analyzer:
         # we store the path.
         if self.config.category == "file":
             self.target = os.path.join(os.environ["TEMP"] + os.sep, str(self.config.file_name))
-            malware_sample_readed = open(self.target, 'rb').read()
-            sha256 = hashlib.sha256(malware_sample_readed).hexdigest()
-            sha1 = hashlib.sha1(malware_sample_readed).hexdigest()
-            md5 = hashlib.md5(malware_sample_readed).hexdigest()
+            malware_sample_read = open(self.target, 'rb').read()
+            sha256 = hashlib.sha256(malware_sample_read).hexdigest()
+            sha1 = hashlib.sha1(malware_sample_read).hexdigest()
+            md5 = hashlib.md5(malware_sample_read).hexdigest()
 
             program_files_path = os.environ['PROGRAMW6432']
             config_path = os.path.join(program_files_path, 'Elastic', 'Agent', 'elastic-agent.yml')
