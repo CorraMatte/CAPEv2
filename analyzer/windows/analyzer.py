@@ -4,18 +4,17 @@
 # TODO
 #  https://github.com/cuckoosandbox/cuckoo/blob/ad5bf8939fb4b86d03c4d96014b174b8b56885e3/cuckoo/core/plugins.py#L29
 
+from __future__ import absolute_import
+
 import hashlib
 import logging
-from __future__ import absolute_import
 import os
+import pkgutil
 import socket
 import struct
-import pkgutil
-import logging
-import hashlib
-import time
 import subprocess
 import sys
+import time
 import timeit
 import traceback
 from ctypes import POINTER, byref, c_int, c_ulong, c_void_p, cast, create_string_buffer, create_unicode_buffer, sizeof
@@ -24,6 +23,7 @@ from shutil import copy
 from threading import Lock
 from urllib.parse import urlencode
 from urllib.request import urlopen
+
 import win32serviceutil
 
 from lib.api.process import Process
