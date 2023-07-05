@@ -7,9 +7,10 @@ import os
 import re
 from contextlib import suppress
 
+from lib.cuckoo.common.path_utils import path_exists
+
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.objects import File
-from lib.cuckoo.common.path_utils import path_exists
 
 log = logging.getLogger(__name__)
 repconf = Config("reporting")

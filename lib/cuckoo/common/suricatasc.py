@@ -104,6 +104,7 @@ class SuricataSC:
             "memcap-set",
             "memcap-show",
             "dataset-add",
+            "ruleset-reload-nonblocking"
         ]
         self.cmd_list = self.basic_commands + self.fn_commands
         self.sck_path = sck_path
