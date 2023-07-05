@@ -431,7 +431,7 @@ class File:
             return results
 
         results = []
-        for c in [category, 'custom']:
+        for c in [category, "custom"]:
             try:
                 rule = File.yara_rules[c]
 

@@ -283,34 +283,45 @@ class Analyzer:
         # we store the path.
         if self.config.category == "file":
             self.target = os.path.join(os.environ["TEMP"] + os.sep, str(self.config.file_name))
-            malware_sample_read = open(self.target, 'rb').read()
+            malware_sample_read = open(self.target, "rb").read()
             sha256 = hashlib.sha256(malware_sample_read).hexdigest()
             sha1 = hashlib.sha1(malware_sample_read).hexdigest()
             md5 = hashlib.md5(malware_sample_read).hexdigest()
 
-            program_files_path = os.environ['PROGRAMW6432']
-            config_path = os.path.join(program_files_path, 'Elastic', 'Agent', 'elastic-agent.yml')
+            program_files_path = os.environ["PROGRAMW6432"]
+            config_path = os.path.join(program_files_path, "Elastic", "Agent", "elastic-agent.yml")
 
-            with open(config_path, 'r') as config_in:
+            with open(config_path, "r") as config_in:
                 config_to_format = config_in.read()
 
             config_formatted = config_to_format.format(
-                md5, sha1, sha256,
-                md5, sha1, sha256,
-
-                md5, sha1, sha256,
-                md5, sha1, sha256,
-
-                md5, sha1, sha256,
-                md5, sha1, sha256,
-
-                md5, sha1, sha256,
+                md5,
+                sha1,
+                sha256,
+                md5,
+                sha1,
+                sha256,
+                md5,
+                sha1,
+                sha256,
+                md5,
+                sha1,
+                sha256,
+                md5,
+                sha1,
+                sha256,
+                md5,
+                sha1,
+                sha256,
+                md5,
+                sha1,
+                sha256,
             )
 
-            with open(config_path, 'w') as config_out:
+            with open(config_path, "w") as config_out:
                 config_out.write(config_formatted)
 
-            win32serviceutil.RestartService('Elastic Agent')
+            win32serviceutil.RestartService("Elastic Agent")
 
             time.sleep(15)
 

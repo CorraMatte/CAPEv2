@@ -11,7 +11,7 @@ from rest_framework.response import Response
 from lib.cuckoo.common.cape_utils import init_yara, log
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT
-from lib.cuckoo.common.suricatasc import SuricataSC, SuricataCommandException
+from lib.cuckoo.common.suricatasc import SuricataCommandException, SuricataSC
 
 YARA_BASE_FOLDER = os.path.join(CUCKOO_ROOT, "data", "yara")
 YARA_CUSTOM_RULE_FOLDERS = [os.path.join(YARA_BASE_FOLDER, "custom")]
